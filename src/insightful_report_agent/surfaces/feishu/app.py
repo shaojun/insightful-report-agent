@@ -31,6 +31,7 @@ from insightful_report_agent.runtime.preprocessor import PreprocessorError, Prep
 from insightful_report_agent.runtime.profiles import thread_id_from_config
 from insightful_report_agent.runtime.source_intake import IntakeStage
 from insightful_report_agent.surfaces.feishu.client import (
+    MAX_DOWNLOAD_BYTES,
     MAX_UPLOAD_BYTES,
     FeishuClient,
     FeishuError,
@@ -46,7 +47,8 @@ _NAMESPACE = ("insightful_report_agent", "feishu", "ingress")
 _ABSTRACT_DELIVERY = ("insightful_report_agent", "feishu", "abstract_delivery")
 _REPORT_PROGRESS_DELIVERY = ("insightful_report_agent", "feishu", "report_progress_delivery")
 _DM_NAMESPACE = ("insightful_report_agent", "feishu", "dm_sessions")
-MAX_FILES = 10
+MAX_FILES = 100
+MAX_BATCH_BYTES = 256 * 1024**2
 RECENT_MESSAGES = 256
 MAX_POST_CHARS = 3500
 PREVIEW_CHARS = 1600
@@ -392,14 +394,21 @@ class FeishuAdapter:
                         self._progress[thread] = progress
                         await progress.start()
                     attached: list[tuple[str, bytes]] = []
+                    remaining_bytes = MAX_BATCH_BYTES
                     for key, name, kind in resources:
+                        if remaining_bytes <= 0:
+                            raise FeishuError("attachment_batch_too_large")
+                        limit = min(MAX_DOWNLOAD_BYTES, remaining_bytes)
                         if kind == "folder":
-                            attached.append(
-                                await asyncio.to_thread(self.client.folder_zip, mid, key, name)
+                            name, data = await asyncio.to_thread(
+                                self.client.folder_zip, mid, key, name, max_bytes=limit
                             )
                         else:
-                            data = await asyncio.to_thread(self.client.download, mid, key, kind)
-                            attached.append((name, data))
+                            data = await asyncio.to_thread(
+                                self.client.download, mid, key, kind, max_bytes=limit
+                            )
+                        attached.append((name, data))
+                        remaining_bytes -= len(data)
                     if attached:
 
                         async def on_preprocess(stage: PreprocessStage, elapsed: float) -> None:
@@ -427,6 +436,21 @@ class FeishuAdapter:
                     await progress.close(failed=True)
                 if isinstance(error, PreprocessorError):
                     await self.post(thread, "外部预处理未返回可用的资料包。请重新发送附件以重试。")
+                elif reason == "too_many_attachments":
+                    await self.post(
+                        thread,
+                        f"每条消息最多可发送 {MAX_FILES} 个附件。请分批上传，最后发送报告要求。",
+                    )
+                elif reason in {
+                    "attachment_batch_too_large",
+                    "attachment_too_large",
+                    "folder_too_large",
+                }:
+                    await self.post(
+                        thread,
+                        f"附件大小超限。单个文件或文件夹最多 {MAX_DOWNLOAD_BYTES // 1024**2} MiB，"
+                        f"每条消息合计最多 {MAX_BATCH_BYTES // 1024**2} MiB。请拆分后上传。",
+                    )
                 elif reason == "folder_preprocessor_not_configured":
                     await self.post(
                         thread,
@@ -530,15 +554,10 @@ class FeishuAdapter:
             data = await read_bytes(
                 self.runtime.binding.sandbox, path, cap_mb=MAX_UPLOAD_BYTES // 1024**2
             )
-            preview = _file_preview("wiki-index.md 预览", data)
         except Exception as error:  # noqa: BLE001 - index delivery must not block the report
             _LOGGER.warning("[feishu] wiki index read failed: %s", type(error).__name__)
             await self.post(thread, "无法读取材料索引文件，已导入的材料可以继续用于报告。")
             return
-        try:
-            await self.post(thread, preview)
-        except FeishuError as error:
-            _LOGGER.warning("[feishu] wiki index preview failed: %s", type(error).__name__)
         try:
             uuid = hashlib.sha256(
                 thread.encode() + path.encode() + hashlib.sha256(data).digest()

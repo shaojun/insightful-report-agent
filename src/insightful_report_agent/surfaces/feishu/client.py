@@ -157,7 +157,9 @@ class FeishuClient:
             json={"content": json.dumps(card, ensure_ascii=False)},
         )
 
-    def folder_zip(self, message: str, key: str, name: str) -> tuple[str, bytes]:
+    def folder_zip(
+        self, message: str, key: str, name: str, *, max_bytes: int = MAX_DOWNLOAD_BYTES
+    ) -> tuple[str, bytes]:
         """Resolve a chat folder and package its file bytes for the existing ZIP intake."""
         try:
             message = identifier(message)
@@ -201,12 +203,13 @@ class FeishuClient:
             output = BytesIO()
             with ZipFile(output, "w") as archive:
                 for relative, child in sorted(files):
-                    content = self.download(
-                        message, child, "file", max_bytes=MAX_DOWNLOAD_BYTES - output.tell()
-                    )
+                    remaining = max_bytes - output.tell()
+                    if remaining <= 0:
+                        raise FolderAttachmentError("folder_too_large")
+                    content = self.download(message, child, "file", max_bytes=remaining)
                     # A fixed member timestamp keeps identical re-uploads content-addressable.
                     archive.writestr(ZipInfo(relative), content)
-            if output.tell() > MAX_DOWNLOAD_BYTES:
+            if output.tell() > max_bytes:
                 raise FolderAttachmentError("folder_too_large")
             return f"{root}.zip", output.getvalue()
         except FolderAttachmentError:

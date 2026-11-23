@@ -23,13 +23,18 @@ from PIL import Image
 from insightful_report_agent.config import Settings
 from insightful_report_agent.runtime.local import build_local_runtime
 from insightful_report_agent.runtime.preprocessor import PreprocessorError
+from insightful_report_agent.surfaces.feishu import app as feishu_app
 from insightful_report_agent.surfaces.feishu.app import (
     FeishuAdapter,
     FeishuFileDelivery,
     FeishuProgressMiddleware,
     thread_id_for,
 )
-from insightful_report_agent.surfaces.feishu.client import FeishuClient, FolderAttachmentError
+from insightful_report_agent.surfaces.feishu.client import (
+    FeishuClient,
+    FeishuError,
+    FolderAttachmentError,
+)
 from insightful_report_agent.tools.delivery import LocalOutputAdapter
 from insightful_report_agent.tools.mineru import MinerU
 from tests.scripted_model import RespondingChatModel, ScriptedChatModel, reply, tool_call
@@ -62,6 +67,66 @@ def event(mid: str, kind: str, body: dict, *, first: bool = False) -> dict:
             },
         },
     }
+
+
+@pytest.mark.parametrize(
+    ("count", "batch_bytes", "error"),
+    [
+        (20, 40, None),
+        (101, 202, "每条消息最多可发送 100 个附件"),
+        (20, 37, "附件大小超限"),
+    ],
+)
+async def test_feishu_post_batches_pdf_attachments(monkeypatch, count, batch_bytes, error):
+    monkeypatch.setattr(feishu_app, "MAX_BATCH_BYTES", batch_bytes)
+    client = MagicMock(spec=FeishuClient)
+
+    def download(_message, _key, _kind, *, max_bytes):
+        if max_bytes < 2:
+            raise FeishuError("attachment_too_large")
+        return b"ok"
+
+    client.download.side_effect = download
+    runtime = MagicMock()
+    runtime.attach = AsyncMock()
+    runtime.ask = AsyncMock(return_value=[AIMessage(content="已收到报告要求")])
+    adapter = FeishuAdapter(
+        client,
+        "cli_test",
+        "tenant",
+        "ou_bot",
+        enable_progress=False,
+        runtime=runtime,
+        store=InMemoryStore(),
+    )
+    prompt = "write me a report of 2k text"
+    payload = event(
+        "om_batch",
+        "post",
+        {
+            "content": [[{"tag": "text", "text": prompt}]],
+            "files": [
+                {"file_key": f"file_{i}", "file_name": f"patent-{i}.pdf"} for i in range(count)
+            ],
+        },
+        first=True,
+    )
+
+    await adapter.handle(payload)
+
+    if error:
+        assert error in str(client.send.call_args.args[3])
+        runtime.attach.assert_not_awaited()
+        runtime.ask.assert_not_awaited()
+        if count > feishu_app.MAX_FILES:
+            client.download.assert_not_called()
+        else:
+            assert client.download.call_args.kwargs == {"max_bytes": 1}
+    else:
+        runtime.attach.assert_awaited_once()
+        thread, files = runtime.attach.await_args.args
+        assert files == [(f"patent-{i}.pdf", b"ok") for i in range(count)]
+        runtime.ask.assert_awaited_once_with(prompt, thread_id=thread)
 
 
 @pytest.mark.skipif(os.getenv("INSIGHTFUL_DOCKER_TESTS") != "1", reason="requires report sandbox")
@@ -219,9 +284,8 @@ async def test_feishu_external_preprocessor_status_and_index(tmp_path, monkeypat
         else:
             assert "外部预处理" + ("部分完成" if failed else "完成") in actions[2]
             assert "耗时" in actions[2]
-        assert f"可用材料 1 项，失败 {failed} 项。" in actions[-2]
-        assert "wiki-index.md 预览" in actions[-1]
-        assert "摘要内容" in actions[-1]
+        assert actions[-1] == f"预处理资料包检查完成。可用材料 1 项，失败 {failed} 项。"
+        assert not any("wiki-index.md 预览" in action or "摘要内容" in action for action in actions)
         client.send_file.assert_called_once()
         assert client.send_file.call_args.args == (
             chat,
