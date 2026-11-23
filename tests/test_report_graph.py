@@ -139,6 +139,8 @@ async def test_preprocessed_archive_to_html_without_provider_calls(tmp_path: Pat
     settings = Settings(
         _env_file=None,
         workspace_root=tmp_path,
+        preprocessor_api_url="http://127.0.0.1:1",
+        preprocessor_api_key="unused-test-key",
         mineru_api_token="legacy-token",
         exa_api_key="legacy-search-key",
         abstract_model="unused:legacy-provider",

@@ -2,18 +2,7 @@
   "version": "0.2.0",
   "configurations": [
     {
-      "name": "Insightful Report Agent · Feishu",
-      "type": "debugpy",
-      "request": "launch",
-      "python": "${workspaceFolder}/.venv/bin/python",
-      "envFile": "${workspaceFolder}/.env",
-      "module": "insightful_report_agent",
-      "args": ["feishu"],
-      "cwd": "${workspaceFolder}",
-      "console": "integratedTerminal"
-    },
-    {
-      "name": "Insightful Report Agent · A2A / HTTP",
+      "name": "Insightful Report Agent",
       "type": "debugpy",
       "request": "launch",
       "python": "${workspaceFolder}/.venv/bin/python",

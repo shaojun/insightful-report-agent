@@ -45,6 +45,7 @@ _DM_NAMESPACE = ("insightful_report_agent", "feishu", "dm_sessions")
 MAX_FILES = 10
 RECENT_MESSAGES = 256
 MAX_POST_CHARS = 3500
+_UNSUPPORTED_FOLDER = "unsupported_folder_attachment"
 _FENCE = re.compile(r"^\s{0,3}(`{3,}|~{3,})(.*)$")
 
 
@@ -208,7 +209,7 @@ def message_content(message: Mapping[str, Any], bot: str) -> tuple[str, list[tup
             if not isinstance(resource, dict):
                 raise FeishuError("invalid_message_content")
             if resource.get("is_folder"):
-                raise FeishuError("unsupported_folder_attachment")
+                raise FeishuError(_UNSUPPORTED_FOLDER)
             key = identifier(str(resource.get("file_key") or ""))
             files.append((key, str(resource.get("file_name") or f"{key}.bin"), "file"))
     else:
@@ -288,9 +289,9 @@ class FeishuAdapter:
             recent = list(state.get("messages") or [])
             if mid in recent:
                 return None
-            text, resources = message_content(message, self.bot)
             is_new = (
-                message.get("message_type") == "text" and text.strip() == "/new" and not resources
+                message.get("message_type") == "text"
+                and message_content(message, self.bot)[0] == "/new"
             )
             root = "dm_" + mid if is_new else str(state.get("root") or "dm")
             await self.store.aput(
@@ -311,6 +312,8 @@ class FeishuAdapter:
         if self.runtime is None:
             raise RuntimeError("wire the runtime before serving")
         message = payload["event"]["message"]
+        sender = payload["event"].get("sender") or {}
+        sender_id = (sender.get("sender_id") or {}).get("open_id")
         chat, mid = identifier(message["chat_id"]), identifier(message["message_id"])
         direct = message["chat_type"] == "p2p"
         root = "dm" if direct else identifier(message.get("root_id") or mid)
@@ -346,36 +349,44 @@ class FeishuAdapter:
                 except FeishuError as error:
                     # A receipt reaction is presentation only; it must never block the work.
                     _LOGGER.warning("[feishu] receipt reaction unavailable: %s", error)
-                text, resources = message_content(message, self.bot)
-                if text or not resources:
-                    progress = FeishuProgress(
-                        self.client, (chat, root), enabled=self.enable_progress
-                    )
-                    self._progress[thread] = progress
-                    await progress.start()
-                attached: list[tuple[str, bytes]] = []
-                for key, name, kind in resources:
-                    data = await asyncio.to_thread(self.client.download, mid, key, kind)
-                    attached.append((name, data))
-                if attached:
-                    await self.runtime.attach(thread, attached)
-                    if not text:
-                        return
-                added = await self.runtime.ask(text or "(attachment)", thread_id=thread)
-                await self.post(thread, final_text(added))
-                if progress is not None:
-                    await progress.close()
+                with self.runtime.trace.request(thread, "feishu", sender_id):
+                    text, resources = message_content(message, self.bot)
+                    if text or not resources:
+                        progress = FeishuProgress(
+                            self.client, (chat, root), enabled=self.enable_progress
+                        )
+                        self._progress[thread] = progress
+                        await progress.start()
+                    attached: list[tuple[str, bytes]] = []
+                    for key, name, kind in resources:
+                        data = await asyncio.to_thread(self.client.download, mid, key, kind)
+                        attached.append((name, data))
+                    if attached:
+                        await self.runtime.attach(thread, attached)
+                        if not text:
+                            return
+                    added = await self.runtime.ask(text or "(attachment)", thread_id=thread)
+                    await self.post(thread, final_text(added))
+                    if progress is not None:
+                        await progress.close()
             except asyncio.CancelledError:
                 if progress is not None:
                     await progress.close(failed=True)
                 raise
             except Exception as error:  # noqa: BLE001 - never echo payloads or provider errors
-                _LOGGER.warning("[feishu] turn failed: %s", type(error).__name__)
+                reason = str(error) if isinstance(error, FeishuError) else type(error).__name__
+                _LOGGER.warning("[feishu] turn failed: %s", reason)
                 if progress is not None:
                     await progress.close(failed=True)
-                await self.post(
-                    thread, "处理失败，附件可能未读取或回复未送达。请重新发送消息重试。"
-                )
+                if reason == _UNSUPPORTED_FOLDER:
+                    await self.post(
+                        thread,
+                        "无法读取飞书文件夹附件。请将文件夹压缩为 ZIP，并和原来的报告要求一起重新发送。",
+                    )
+                else:
+                    await self.post(
+                        thread, "处理失败，附件可能未读取或回复未送达。请重新发送消息重试。"
+                    )
             finally:
                 self._progress.pop(thread, None)
 
@@ -551,8 +562,9 @@ async def _worker(
             adapter.runtime, adapter.store = runtime, store
             keeper = None
             try:
-                await maintenance.start(runtime, store)
-                keeper = asyncio.create_task(maintenance.run(runtime, store))
+                prefix = f"feishu:{adapter.tenant}:"
+                await maintenance.start(runtime, store, thread_prefix=prefix)
+                keeper = asyncio.create_task(maintenance.run(runtime, store, thread_prefix=prefix))
                 stop = asyncio.Event()
                 if ready.cancelled():
                     return

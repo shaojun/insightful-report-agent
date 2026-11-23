@@ -90,18 +90,35 @@ async def run_request(
             for path in sources:
                 if path.stat().st_size > 200 * 1024**2:
                     raise click.ClickException(f"File exceeds 200 MiB: {path.name}")
-            for path in sources:
-                await runtime.attach(thread, [(path.name, path.read_bytes())])
-            click.echo(f"Thread {thread}")
-            if request.strip():
-                result = await runtime.ask(request, thread_id=thread)
-                click.echo(final_text(result))
-            else:
-                await runtime.source_intake.wait_ready(thread)
-                click.echo(f"Collected {len(sources)} files and finished source preparation.")
-            if (output := runtime.out_dir / thread).is_dir():
-                for file in sorted(output.glob("insightful-report-*.html")):
-                    click.echo(file.resolve())
+            with runtime.trace.request(thread, "cli"):
+                click.echo(f"Thread {thread}")
+                if (
+                    sources
+                    and settings.preprocessor_api_url
+                    and settings.source_input_mode == "preprocessed"
+                ):
+                    batch: list[tuple[str, bytes]] = []
+                    batch_bytes = 0
+                    for path in sources:
+                        if batch and batch_bytes + path.stat().st_size > 200 * 1024**2:
+                            await runtime.attach(thread, batch)
+                            batch, batch_bytes = [], 0
+                        content = path.read_bytes()
+                        batch.append((path.name, content))
+                        batch_bytes += len(content)
+                    await runtime.attach(thread, batch)
+                else:
+                    for path in sources:
+                        await runtime.attach(thread, [(path.name, path.read_bytes())])
+                if request.strip():
+                    result = await runtime.ask(request, thread_id=thread)
+                    click.echo(final_text(result))
+                else:
+                    await runtime.source_intake.wait_ready(thread)
+                    click.echo(f"Collected {len(sources)} files and finished source preparation.")
+                if (output := runtime.out_dir / thread).is_dir():
+                    for file in sorted(output.glob("insightful-report-*.html")):
+                        click.echo(file.resolve())
         finally:
             await runtime.aclose()
             if runtime.binding.runner is not None:
@@ -111,25 +128,32 @@ async def run_request(
 @main.command()
 @click.option(
     "--env-file",
-    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    type=click.Path(exists=True, dir_okay=False, path_type=Path, resolve_path=True),
     help="Read a service-specific settings file after the project .env.",
 )
-def serve(env_file: Path | None) -> None:
-    """Serve the HTTP and A2A transports."""
+@click.option("--api-only", is_flag=True, help="Skip the configured Feishu and Slack adapters.")
+def serve(env_file: Path | None, api_only: bool) -> None:
+    """Start HTTP, A2A and any configured chat adapters."""
     import uvicorn
 
-    from insightful_report_agent.surfaces.api.app import create_app
+    from insightful_report_agent.surfaces.service import create_service_app
 
     root, settings = configured(override=env_file)
-    uvicorn.run(create_app(root, settings), host=settings.api_host, port=settings.api_port)
+    app = create_service_app(root, settings, env_file=env_file, api_only=api_only)
+    uvicorn.run(app, host=settings.api_host, port=settings.api_port)
 
 
 @main.command()
-def feishu() -> None:
+@click.option(
+    "--env-file",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path, resolve_path=True),
+    help="Read a service-specific settings file after the project .env.",
+)
+def feishu(env_file: Path | None) -> None:
     """Run the Feishu long-connection bot."""
     from insightful_report_agent.surfaces.feishu.app import serve
 
-    serve(*configured())
+    serve(*configured(override=env_file))
 
 
 @main.command()

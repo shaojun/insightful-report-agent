@@ -5,12 +5,14 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections.abc import Awaitable, Callable, Mapping
+from contextlib import nullcontext
 from typing import Literal
 
 from langchain_core.runnables.config import var_child_runnable_config
 from langgraph.store.base import BaseStore
 
 from insightful_report_agent.middleware.workspace import stage
+from insightful_report_agent.runtime.observability import Observability
 from insightful_report_agent.runtime.sandbox import SandboxBinding
 from insightful_report_agent.tools.sources import SourceLibrary
 from insightful_report_agent.workspace.manifest import Manifest
@@ -31,6 +33,8 @@ class SourceIntake:
         store: BaseStore,
         surface: str,
         notify: IntakeNotify | None = None,
+        *,
+        trace: Observability | None = None,
     ) -> None:
         self.binding = binding
         self.manifest = manifest
@@ -38,6 +42,8 @@ class SourceIntake:
         self.store = store
         self.namespace = ("insightful_report_agent", "source_intake", surface)
         self.notify = notify
+        self.trace = trace
+        self.surface = surface
         self.tasks: dict[str, asyncio.Task[None]] = {}
         self._locks: dict[str, asyncio.Lock] = {}
         self._dirty: set[str] = set()
@@ -59,14 +65,19 @@ class SourceIntake:
                 pending["attachments"] = sorted(paths.union(files) if notify else paths)
             await self.store.aput(self.namespace, thread, pending)
             self._ready.discard(thread)
-            token = var_child_runnable_config.set({"configurable": {"thread_id": thread}})
             try:
-                uploaded = await self.binding.sandbox.aupload_files(list(files.items()))
-                if len(uploaded) != len(files) or any(item.error for item in uploaded):
-                    raise RuntimeError("Attachment upload failed")
+                await self.upload(thread, files)
             finally:
-                var_child_runnable_config.reset(token)
                 self._schedule(thread)
+
+    async def upload(self, thread: str, files: Mapping[str, bytes]) -> None:
+        token = var_child_runnable_config.set({"configurable": {"thread_id": thread}})
+        try:
+            uploaded = await self.binding.sandbox.aupload_files(list(files.items()))
+            if len(uploaded) != len(files) or any(item.error for item in uploaded):
+                raise RuntimeError("Attachment upload failed")
+        finally:
+            var_child_runnable_config.reset(token)
 
     def _schedule(self, thread: str) -> asyncio.Task[None]:
         self._dirty.add(thread)
@@ -92,6 +103,14 @@ class SourceIntake:
             _LOGGER.warning("Source intake notification failed (%s)", type(error).__name__)
 
     async def _run(self, thread: str) -> None:
+        trace = self.trace
+        with (
+            trace.request(thread, self.surface) if trace else nullcontext(),
+            trace.span("sources.import") if trace else nullcontext(),
+        ):
+            await self._import_sources(thread)
+
+    async def _import_sources(self, thread: str) -> None:
         token = var_child_runnable_config.set({"configurable": {"thread_id": thread}})
         paths: set[str] = set()
         try:
@@ -165,12 +184,13 @@ class SourceIntake:
         if task is not None:
             await asyncio.shield(task)
 
-    async def restore(self) -> None:
+    async def restore(self, *, thread_prefix: str | tuple[str, ...] = "") -> None:
         pending = []
         while batch := await self.store.asearch(self.namespace, limit=100, offset=len(pending)):
             pending.extend(batch)
         for item in pending:
-            self._schedule(item.key)
+            if item.key.startswith(thread_prefix):
+                self._schedule(item.key)
 
     async def aclose(self) -> None:
         tasks = list(self.tasks.values())

@@ -25,6 +25,8 @@ from insightful_report_agent.harness import notices
 from insightful_report_agent.harness.tasks import REGISTRY
 from insightful_report_agent.middleware.background import BackgroundServices
 from insightful_report_agent.middleware.watch_tools import WATCHES
+from insightful_report_agent.runtime.observability import Observability
+from insightful_report_agent.runtime.preprocessor import is_prepared, preprocess
 from insightful_report_agent.runtime.profiles import RuntimeProfile
 from insightful_report_agent.runtime.sandbox import SandboxBinding, select_binding
 from insightful_report_agent.runtime.source_intake import IntakeNotify, SourceIntake
@@ -99,12 +101,15 @@ class LocalRuntime:
     services: BackgroundServices
     replies: Replies
     source_intake: SourceIntake
+    trace: Observability
+    surface: str
     _locks: dict[str, asyncio.Lock] = field(default_factory=dict)
 
     def _config(self, thread_id: str, extra: Mapping[str, Any] | None = None) -> dict[str, Any]:
         return {
             "configurable": {**(extra or {}), "thread_id": thread_id},
             "recursion_limit": DEFAULT_RECURSION_LIMIT,
+            "callbacks": self.trace.callbacks(),
         }
 
     def _lock(self, thread_id: str) -> asyncio.Lock:
@@ -115,8 +120,9 @@ class LocalRuntime:
     ) -> list[BaseMessage]:
         """Run one turn and return the messages it added. `configurable` carries what a surface
         knows about the request (the Slack adapter's event)."""
-        async with self._lock(thread_id):
-            return await self._turn(thread_id, message, configurable)
+        with self.trace.request(thread_id, self.surface):
+            async with self._lock(thread_id):
+                return await self._turn(thread_id, message, configurable)
 
     async def _turn(
         self, thread_id: str, message: str, configurable: Mapping[str, Any] | None = None
@@ -135,28 +141,37 @@ class LocalRuntime:
                     )
                 )
             ]
-        await self.source_intake.wait_ready(thread_id)
-        config = self._config(thread_id, configurable)
-        before = await self._message_count(config)
-        result = await self.graph.ainvoke(
-            {"messages": [HumanMessage(content=message)]}, config=config
-        )
+        with self.trace.span("sources.await_ready"):
+            await self.source_intake.wait_ready(thread_id)
+        with self.trace.span("report.agent"):
+            config = self._config(thread_id, configurable)
+            before = await self._message_count(config)
+            result = await self.graph.ainvoke(
+                {"messages": [HumanMessage(content=message)]}, config=config
+            )
         messages: list[BaseMessage] = list(result.get("messages", []))
         return messages[before:]
 
     async def wake_turn(self, thread_id: str, message: str, started: asyncio.Event) -> None:
         """A turn the waker started: after the person's own turn on the thread, never during it."""
-        async with self._lock(thread_id):
-            started.set()
-            added = await self._turn(thread_id, message)
+        with self.trace.request(thread_id, self.surface):
+            async with self._lock(thread_id):
+                started.set()
+                added = await self._turn(thread_id, message)
         text = final_text(added)
         if text and notices.should_post(text):
             self.replies(thread_id, text)
 
     async def attach(self, thread_id: str, files: Sequence[tuple[str, bytes]]) -> list[str]:
         """Store original bytes in the thread. Same names with different content coexist."""
-        async with self._lock(thread_id):
-            return await self._attach(thread_id, files)
+        with (
+            self.trace.request(thread_id, self.surface),
+            self.trace.span(
+                "sources.received", files=len(files), bytes=sum(len(data) for _, data in files)
+            ),
+        ):
+            async with self._lock(thread_id):
+                return await self._attach(thread_id, files)
 
     async def _attach(
         self, thread_id: str, files: Sequence[tuple[str, bytes]], *, notify: bool = True
@@ -180,8 +195,35 @@ class LocalRuntime:
             placed[f"/workspace/attachments/{folder}/{clean}"] = content
         if not placed:
             return []
+        if (
+            not self.components.source_library.legacy
+            and self.settings.preprocessor_api_url
+            and self.settings.preprocessor_api_key
+        ):
+            placed = await self._preprocess_raw(thread_id, placed)
         await self.source_intake.attach(thread_id, placed, notify=notify)
         return list(placed)
+
+    async def _preprocess_raw(self, thread: str, placed: dict[str, bytes]) -> dict[str, bytes]:
+        raw, prepared = {}, {}
+        for path, data in placed.items():
+            target = prepared if is_prepared(path, data) else raw
+            target[path] = data
+        if not raw:
+            return prepared
+        originals = {
+            path.replace("/workspace/attachments/", "/workspace/source-library/originals/", 1): data
+            for path, data in raw.items()
+        }
+        await self.source_intake.upload(thread, originals)
+        inputs = {}
+        for path, data in raw.items():
+            file = Path(path)
+            name = file.name if file.name not in inputs else f"{file.parent.name}/{file.name}"
+            inputs[name] = data
+        name, content = await preprocess(self.settings, self.trace, inputs)
+        prepared[f"/workspace/attachments/{hashlib.sha256(content).hexdigest()}/{name}"] = content
+        return prepared
 
     def busy(self) -> bool:
         """Whether a helper, watch, check-in or woken turn is outstanding on this runtime's threads."""
@@ -232,20 +274,23 @@ class LocalRuntime:
         return False
 
     async def stream(self, message: str, *, thread_id: str) -> AsyncIterator[dict[str, Any]]:
-        async with self._lock(thread_id):
-            if self.components.source_library.legacy and (urls := urls_from_text(message)):
-                await self._attach(thread_id, url_files(urls), notify=False)
-            await self.source_intake.wait_ready(thread_id)
-            async for chunk in self.graph.astream(
-                {"messages": [HumanMessage(content=message)]},
-                config=self._config(thread_id),
-                stream_mode="updates",
-            ):
-                yield chunk
+        with self.trace.request(thread_id, self.surface), self.trace.span("report.agent"):
+            async with self._lock(thread_id):
+                if self.components.source_library.legacy and (urls := urls_from_text(message)):
+                    await self._attach(thread_id, url_files(urls), notify=False)
+                await self.source_intake.wait_ready(thread_id)
+                async for chunk in self.graph.astream(
+                    {"messages": [HumanMessage(content=message)]},
+                    config=self._config(thread_id),
+                    stream_mode="updates",
+                ):
+                    yield chunk
 
     async def aclose(self) -> None:
+        await self.waker.aclose()
         await self.source_intake.aclose()
         await self.services.aclose()
+        await self.trace.flush()
 
     async def _message_count(self, config: Mapping[str, Any]) -> int:
         state = await self.graph.aget_state(config)
@@ -281,6 +326,12 @@ def build_local_runtime(
     """Select the sandbox, assemble the components, compile the graph and wire the waker.
 
     MCP tools are loaded by the caller (`tools.mcp.load_mcp_tools`, async) and passed in."""
+    if (
+        settings.source_input_mode == "preprocessed"
+        and settings.preprocessor_api_url
+        and not settings.preprocessor_api_key
+    ):
+        raise ValueError("BRFP_API_KEY is required when PREPROCESSOR_API_URL is configured")
     chosen = binding if binding is not None else select_binding(settings, project_root)
     workspace_root = (
         settings.workspace_root
@@ -314,6 +365,7 @@ def build_local_runtime(
         mcp_servers=mcp_servers,
         mcp_tools=mcp_tools,
     )
+    trace = Observability(settings)
     runtime = LocalRuntime(
         settings=settings,
         project_root=project_root,
@@ -324,6 +376,8 @@ def build_local_runtime(
         waker=waker,
         services=services,
         replies=replies or (lambda _thread, text: print(text)),
+        trace=trace,
+        surface=surface,
         source_intake=SourceIntake(
             chosen,
             components.manifest,
@@ -331,6 +385,7 @@ def build_local_runtime(
             store,
             surface,
             notify=source_intake_notify,
+            trace=trace,
         ),
     )
     holder.append(runtime)

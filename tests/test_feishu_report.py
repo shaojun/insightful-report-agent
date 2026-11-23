@@ -9,6 +9,7 @@ import os
 from email import policy
 from email.parser import BytesParser
 from pathlib import Path
+from unittest.mock import MagicMock
 from uuid import uuid4
 from zipfile import ZipFile
 
@@ -34,9 +35,6 @@ from tests.scripted_model import RespondingChatModel, ScriptedChatModel, reply, 
 from tests.test_report_graph import tool_data
 
 ROOT = Path(__file__).resolve().parents[1]
-pytestmark = pytest.mark.skipif(
-    os.getenv("INSIGHTFUL_DOCKER_TESTS") != "1", reason="needs the report Docker image"
-)
 
 
 def event(mid: str, kind: str, body: dict, *, first: bool = False) -> dict:
@@ -65,6 +63,36 @@ def event(mid: str, kind: str, body: dict, *, first: bool = False) -> dict:
     }
 
 
+async def test_feishu_dm_with_folder_replies_with_zip_instructions() -> None:
+    client = MagicMock(spec=FeishuClient)
+    runtime = MagicMock()
+    adapter = FeishuAdapter(
+        client, "cli_test", "tenant", "ou_bot", runtime=runtime, store=InMemoryStore()
+    )
+    payload = event(
+        "om_folder",
+        "post",
+        {
+            "content": [[{"tag": "text", "text": "帮我写一份报告"}]],
+            "files": [{"file_name": "test-bulk-preprocess", "is_folder": True}],
+        },
+    )
+    payload["event"]["message"]["chat_type"] = "p2p"
+
+    await adapter.handle(payload)
+    await adapter.handle(payload)
+
+    client.send.assert_called_once()
+    chat, root, kind, body = client.send.call_args.args
+    assert (chat, root, kind) == ("oc_chat", "dm", "post")
+    assert "ZIP" in body["zh_cn"]["content"][0][0]["text"]
+    client.download.assert_not_called()
+    runtime.ask.assert_not_called()
+
+
+@pytest.mark.skipif(
+    os.getenv("INSIGHTFUL_DOCKER_TESTS") != "1", reason="needs the report Docker image"
+)
 async def test_feishu_multiple_messages_and_files_to_rich_report(tmp_path: Path) -> None:
     photo = io.BytesIO()
     Image.new("RGB", (200, 90), "#c0e5ed").save(photo, "PNG")

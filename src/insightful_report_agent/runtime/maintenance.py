@@ -16,14 +16,18 @@ SWEEP_SECONDS = 15 * 60
 REAP_SECONDS = 60
 
 
-async def start(runtime: LocalRuntime, store: Any) -> None:
+async def start(
+    runtime: LocalRuntime, store: Any, *, thread_prefix: str | tuple[str, ...]
+) -> None:
     """The first sweep and the check-ins a previous process kept, before serving."""
-    await runtime.services.sweep(store)
-    await runtime.source_intake.restore()
-    await runtime.waker.restore()
+    await runtime.services.sweep(store, thread_prefix=thread_prefix)
+    await runtime.source_intake.restore(thread_prefix=thread_prefix)
+    await runtime.waker.restore(thread_prefix=thread_prefix)
 
 
-async def run(runtime: LocalRuntime, store: Any) -> None:
+async def run(
+    runtime: LocalRuntime, store: Any, *, thread_prefix: str | tuple[str, ...]
+) -> None:
     elapsed = 0
     while True:
         await asyncio.sleep(REAP_SECONDS)
@@ -44,6 +48,6 @@ async def run(runtime: LocalRuntime, store: Any) -> None:
                         "[maintenance] workspace cleanup failed: %s", type(error).__name__
                     )
             try:
-                await runtime.services.sweep(store)
+                await runtime.services.sweep(store, thread_prefix=thread_prefix)
             except Exception as error:  # noqa: BLE001 - the next pass tries again
                 _LOGGER.warning("[maintenance] the sweep failed: %s", type(error).__name__)

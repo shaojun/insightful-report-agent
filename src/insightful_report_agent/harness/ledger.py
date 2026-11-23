@@ -132,6 +132,7 @@ async def sweep(
     on_task: OnFound,
     on_wakeup: OnFound,
     held_wakeups: Callable[[str], bool] = lambda _key: False,
+    thread_prefix: str | tuple[str, ...] = "",
     now: float | None = None,
 ) -> int:
     """Hand every record no live process holds to `on_task` / `on_wakeup`, and delete it.
@@ -143,6 +144,8 @@ async def sweep(
     found = 0
     for item in await store.asearch(LEDGER, limit=200):
         value = dict(item.value or {})
+        if not str(value.get("thread_id", "")).startswith(thread_prefix):
+            continue
         held = item.key in REGISTRY and not REGISTRY[item.key].delivered
         if held or now - float(value.get("alive_at") or 0) < STALE_SECONDS:
             continue
@@ -151,6 +154,8 @@ async def sweep(
         found += 1
     for item in await store.asearch(WAKEUP_LEDGER, limit=200):
         value = dict(item.value or {})
+        if not str(value.get("thread_id", "")).startswith(thread_prefix):
+            continue
         if held_wakeups(item.key) or float(value.get("due_at") or 0) > now - 60:
             continue
         await store.adelete(WAKEUP_LEDGER, item.key)

@@ -31,6 +31,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from fastapi import FastAPI, HTTPException, Request
+
 from insightful_report_agent.config import Settings
 from insightful_report_agent.harness import notices
 from insightful_report_agent.runtime.local import LocalRuntime, final_text
@@ -139,32 +141,35 @@ class SlackAdapter:
         except SlackError:
             pass  # presentation only
         try:
-            attached, failed = await self._attachments(thread, event)
-            if failed:
-                await self.post(thread, f"{failed} 个附件下载失败或超过单条消息上限，请重新上传。")
-            if (failed or attached) and not text:
-                if attached:
-                    activity = (
-                        "正在后台解析并生成概览摘要"
-                        if self.runtime.components.source_library.legacy
-                        else "正在检查预处理资料包"
-                    )
+            with self.runtime.trace.request(thread, "slack", str(event.get("user") or "")):
+                attached, failed = await self._attachments(thread, event)
+                if failed:
                     await self.post(
-                        thread,
-                        f"已收到 {len(attached)} 个附件，{activity}。"
-                        "可以继续上传，或在同一线程发来报告目标。",
+                        thread, f"{failed} 个附件下载失败或超过单条消息上限，请重新上传。"
                     )
-                return
-            added = await self.runtime.ask(
-                text or "(no text)", thread_id=thread, configurable={"slack_event": dict(event)}
-            )
+                if (failed or attached) and not text:
+                    if attached:
+                        activity = (
+                            "正在后台解析并生成概览摘要"
+                            if self.runtime.components.source_library.legacy
+                            else "正在检查预处理资料包"
+                        )
+                        await self.post(
+                            thread,
+                            f"已收到 {len(attached)} 个附件，{activity}。"
+                            "可以继续上传，或在同一线程发来报告目标。",
+                        )
+                    return
+                added = await self.runtime.ask(
+                    text or "(no text)", thread_id=thread, configurable={"slack_event": dict(event)}
+                )
+                await self.post(thread, final_text(added))
         except Exception as error:  # noqa: BLE001 - the person hears that it failed, never silence
             _LOGGER.warning("[slack] the turn failed: %s", type(error).__name__)
             await self.post(
                 thread, "Something went wrong on my side; nothing was lost. Try again in a moment."
             )
             return
-        await self.post(thread, final_text(added))
 
     async def _attachments(self, thread: str, event: Mapping[str, Any]) -> tuple[list[str], int]:
         if self.runtime is None:
@@ -215,7 +220,7 @@ def register(app: Any, adapter: SlackAdapter) -> None:
     app.event("message")(on_message)
 
 
-async def serve(project_root: Path, settings: Settings) -> None:
+async def serve(project_root: Path, settings: Settings, *, web: FastAPI | None = None) -> None:
     """Run the Slack app until stopped (module doc)."""
     from slack_bolt.async_app import AsyncApp
 
@@ -228,78 +233,110 @@ async def serve(project_root: Path, settings: Settings) -> None:
 
     if settings.slack_bot_token is None:
         raise SystemExit("SLACK_BOT_TOKEN is not set")
+    if settings.slack_transport == "socket_mode" and settings.slack_app_token is None:
+        raise SystemExit("Socket Mode needs SLACK_APP_TOKEN (or set SLACK_TRANSPORT=http)")
+    if settings.slack_transport == "http" and settings.slack_signing_secret is None:
+        raise SystemExit("HTTP mode needs SLACK_SIGNING_SECRET to verify Slack's requests")
     token = settings.slack_bot_token.get_secret_value()
     client = SlackClient(token)
-    identity = await client.identity()
-    adapter = SlackAdapter(
-        client, identity.team_id, identity.user_id, settings.slack_trigger_on_all_messages
-    )
-    servers = servers_for_runtime(project_root, settings, "self_hosted")
-    loaded = await load_mcp_tools(servers)
-    servers = [s for s in servers if s.name not in loaded.failed]
-    tools = admit_paper_tools(loaded.tools, PaperPolicy.from_settings(settings))
-    workspace = workspace_of(settings, project_root)
-    async with open_persistence(settings, workspace) as (checkpointer, store):
-        runtime = build_local_runtime(
-            settings,
-            project_root,
-            checkpointer=checkpointer,
-            store=store,
-            replies=adapter.post_soon,
-            mcp_servers=servers,
-            mcp_tools=tools,
-            slack=SlackSurface(
-                BoltSlackResolver(token),
-                mention_required=not settings.slack_trigger_on_all_messages,
-            ),
-            surface="slack",
-            delivery=SlackFileDelivery(token, LocalOutputAdapter(workspace / "out")),
+    try:
+        identity = await client.identity()
+        adapter = SlackAdapter(
+            client, identity.team_id, identity.user_id, settings.slack_trigger_on_all_messages
         )
-        adapter.runtime = runtime
-        await maintenance.start(runtime, store)
-        keeper = asyncio.get_running_loop().create_task(
-            maintenance.run(runtime, store), name="maintenance"
-        )
-        signing = (
-            settings.slack_signing_secret.get_secret_value()
-            if settings.slack_signing_secret
-            else None
-        )
-        app = AsyncApp(
-            token=token, signing_secret=signing, request_verification_enabled=signing is not None
-        )
-        register(app, adapter)
-        try:
-            await _serve_transport(app, settings)
-        finally:
-            keeper.cancel()
-            await runtime.aclose()
-            if runtime.binding.runner is not None:
-                runtime.binding.runner.stop_all()
-            await client.aclose()
+        servers = servers_for_runtime(project_root, settings, "self_hosted")
+        loaded = await load_mcp_tools(servers)
+        servers = [s for s in servers if s.name not in loaded.failed]
+        tools = admit_paper_tools(loaded.tools, PaperPolicy.from_settings(settings))
+        workspace = workspace_of(settings, project_root)
+        async with open_persistence(settings, workspace) as (checkpointer, store):
+            runtime = build_local_runtime(
+                settings,
+                project_root,
+                checkpointer=checkpointer,
+                store=store,
+                replies=adapter.post_soon,
+                mcp_servers=servers,
+                mcp_tools=tools,
+                slack=SlackSurface(
+                    BoltSlackResolver(token),
+                    mention_required=not settings.slack_trigger_on_all_messages,
+                ),
+                surface="slack",
+                delivery=SlackFileDelivery(token, LocalOutputAdapter(workspace / "out")),
+            )
+            adapter.runtime = runtime
+            keeper = None
+            try:
+                prefix = f"slack-{identity.team_id}-"
+                await maintenance.start(runtime, store, thread_prefix=prefix)
+                keeper = asyncio.create_task(
+                    maintenance.run(runtime, store, thread_prefix=prefix), name="slack maintenance"
+                )
+                signing = (
+                    settings.slack_signing_secret.get_secret_value()
+                    if settings.slack_signing_secret
+                    else None
+                )
+                app = AsyncApp(
+                    token=token,
+                    signing_secret=signing,
+                    request_verification_enabled=signing is not None,
+                )
+                register(app, adapter)
+                await _serve_transport(app, settings, web=web)
+            finally:
+                if keeper is not None:
+                    keeper.cancel()
+                    await asyncio.gather(keeper, return_exceptions=True)
+                tasks = list(adapter._tasks)
+                for task in tasks:
+                    task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
+                await runtime.aclose()
+                if runtime.binding.runner is not None:
+                    runtime.binding.runner.stop_all()
+    finally:
+        await client.aclose()
 
 
-async def _serve_transport(app: Any, settings: Settings) -> None:
+def install_webhook(web: FastAPI) -> None:
+    @web.post("/slack/events")
+    async def events(request: Request) -> Any:
+        handler = getattr(request.app.state, "slack_handler", None)
+        if handler is None:
+            raise HTTPException(status_code=503, detail="Slack is unavailable")
+        return await handler.handle(request)
+
+
+async def _serve_transport(app: Any, settings: Settings, *, web: FastAPI | None = None) -> None:
     if settings.slack_transport == "socket_mode":
         from slack_bolt.adapter.socket_mode.async_handler import AsyncSocketModeHandler
 
         if settings.slack_app_token is None:
             raise SystemExit("Socket Mode needs SLACK_APP_TOKEN (or set SLACK_TRANSPORT=http)")
         socket: Any = AsyncSocketModeHandler(app, settings.slack_app_token.get_secret_value())
-        await socket.start_async()
+        try:
+            await socket.start_async()
+        finally:
+            await socket.close_async()
         return
-    if settings.slack_signing_secret is None:
-        raise SystemExit("HTTP mode needs SLACK_SIGNING_SECRET to verify Slack's requests")
-    import uvicorn
-    from fastapi import FastAPI, Request
     from slack_bolt.adapter.starlette.async_handler import AsyncSlackRequestHandler
 
     handler = AsyncSlackRequestHandler(app)
-    web = FastAPI(docs_url=None, redoc_url=None)
+    if web is not None:
+        web.state.slack_handler = handler
+        try:
+            await asyncio.Future()
+        finally:
+            web.state.slack_handler = None
+        return
 
-    @web.post("/slack/events")
-    async def events(request: Request) -> Any:
-        return await handler.handle(request)
+    import uvicorn
+
+    web = FastAPI(docs_url=None, redoc_url=None)
+    web.state.slack_handler = handler
+    install_webhook(web)
 
     server = uvicorn.Server(
         uvicorn.Config(web, host=settings.api_host, port=settings.api_port, log_level="info")

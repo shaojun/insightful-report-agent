@@ -214,58 +214,59 @@ class ReportExecutor(AgentExecutor):
 
             self.app.state.a2a_progress[thread_id] = progress
             try:
-                before = len(await state.store.asearch((*UPDATES, thread_id), limit=10_000))
-                paths = await state.runtime.attach(thread_id, files) if files else []
-                urls = urls_from_text(text)
-                prose = text
-                for url in urls:
-                    prose = prose.replace(url, "")
-                configurable = {"surface": "a2a"}
-                legacy = state.runtime.components.source_library.legacy
-                if legacy and (paths or urls) and not prose.strip():
-                    configurable["sources_only"] = len(paths) + len(urls)
-                elif paths and not text:
-                    configurable["sources_only"] = len(paths)
-                added = await state.runtime.ask(
-                    text, thread_id=thread_id, configurable=configurable
-                )
-                reply = final_text(added)
-                if reply:
-                    await updater.start_work(self._message(reply, context_id, task_id))
-                # A lead can return while its helpers render. Keep the A2A task working.
-                # Read helper replies while they run, rather than collecting only at completion.
-                while True:
-                    pending = not configurable.get("sources_only") and state.runtime.thread_busy(
-                        thread_id
+                with state.runtime.trace.request(thread_id, "a2a", caller):
+                    before = len(await state.store.asearch((*UPDATES, thread_id), limit=10_000))
+                    paths = await state.runtime.attach(thread_id, files) if files else []
+                    urls = urls_from_text(text)
+                    prose = text
+                    for url in urls:
+                        prose = prose.replace(url, "")
+                    configurable = {"surface": "a2a"}
+                    legacy = state.runtime.components.source_library.legacy
+                    if legacy and (paths or urls) and not prose.strip():
+                        configurable["sources_only"] = len(paths) + len(urls)
+                    elif paths and not text:
+                        configurable["sources_only"] = len(paths)
+                    added = await state.runtime.ask(
+                        text, thread_id=thread_id, configurable=configurable
                     )
-                    updates = sorted(
-                        await state.store.asearch((*UPDATES, thread_id), limit=10_000),
-                        key=lambda i: i.key,
-                    )
-                    for item in updates[before:]:
-                        reply = str(item.value.get("text", "")) or reply
+                    reply = final_text(added)
+                    if reply:
                         await updater.start_work(self._message(reply, context_id, task_id))
-                    before = len(updates)
-                    if not pending:
-                        break
-                    await asyncio.sleep(0.5)
-                if reply:
-                    await updater.add_artifact([Part(text=reply)], name="reply")
-                for name in _files(state.runtime, thread_id):
-                    await updater.add_artifact(
-                        [
-                            Part(
-                                url=f"{self.base}/threads/{thread_id}/files/{quote(name, safe='')}",
-                                filename=name,
-                                media_type=mimetypes.guess_type(name)[0]
-                                or "application/octet-stream",
-                            )
-                        ],
-                        name=name,
+                    # A lead can return while its helpers render. Keep the A2A task working.
+                    # Read helper replies while they run, rather than collecting only at completion.
+                    while True:
+                        pending = not configurable.get(
+                            "sources_only"
+                        ) and state.runtime.thread_busy(thread_id)
+                        updates = sorted(
+                            await state.store.asearch((*UPDATES, thread_id), limit=10_000),
+                            key=lambda i: i.key,
+                        )
+                        for item in updates[before:]:
+                            reply = str(item.value.get("text", "")) or reply
+                            await updater.start_work(self._message(reply, context_id, task_id))
+                        before = len(updates)
+                        if not pending:
+                            break
+                        await asyncio.sleep(0.5)
+                    if reply:
+                        await updater.add_artifact([Part(text=reply)], name="reply")
+                    for name in _files(state.runtime, thread_id):
+                        await updater.add_artifact(
+                            [
+                                Part(
+                                    url=f"{self.base}/threads/{thread_id}/files/{quote(name, safe='')}",
+                                    filename=name,
+                                    media_type=mimetypes.guess_type(name)[0]
+                                    or "application/octet-stream",
+                                )
+                            ],
+                            name=name,
+                        )
+                    await updater.complete(
+                        self._message(reply or "Turn completed.", context_id, task_id)
                     )
-                await updater.complete(
-                    self._message(reply or "Turn completed.", context_id, task_id)
-                )
             except Exception as error:  # noqa: BLE001 - model/tool errors become safe task failures
                 _LOGGER.warning("A2A execution failed: %s", type(error).__name__)
                 await updater.failed(

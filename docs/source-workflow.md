@@ -2,6 +2,8 @@
 
 默认入口接收 Bulk Reference Files Preprocessor **生成的结果 ZIP**。原始文件、原始 ZIP、网页和 WebDAV 路径由该服务处理。报告 Agent 导入归档时保留 ZIP 校验值和每份导出正文的校验值，遍历 `wiki-index.md` 及分页索引，按原始材料登记成功与失败。正文和图片保留导出行位置。归档未提供原始二进制文件的校验值或物理页码时，报告将明确使用导出定位。原图在正文取证时按需读取，不触发 OCR 或摘要模型。
 
+开启原始附件直连后，Agent 将收到的原始文件和原始 ZIP 交给同一个外部服务，下载结果包后接续上述导入流程。见 [运行与接入](operations.md#原始附件直连预处理)。
+
 工作流通过 `prepare_source_overview` 读取分页覆盖结果，`synthesize_source_overview` 建立当前快照的可发布覆盖目录。随后按章节查阅现有简报与原文，用 `publish_report(validate_only=true)` 渲染检查，再交付 HTML。
 
 ## 旧版原始文件收件

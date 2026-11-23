@@ -13,8 +13,8 @@ Not the LangGraph Agent Server protocol; a small surface for your own tools and 
 
 Ordinary thread routes need `Authorization: Bearer <token>`; `INSIGHTFUL_REPORT_AGENT_ACCESS_TOKEN_CALLERS` maps
 tokens to callers (`token:caller,...`). A thread belongs to the caller who started it; another
-caller gets 404 for it, never its contents. With no tokens configured the server refuses to start
-unless anonymous A2A is enabled. A2A requires caller tokens by default (see surfaces/a2a/).
+caller gets 404 for it, never its contents. With no tokens configured, protected routes return 401.
+A2A requires caller tokens by default (see surfaces/a2a/).
 
 Durability comes from `runtime/persistence.py` (Postgres with `DATABASE_URL`). At startup the
 server sweeps what a restart killed and re-arms check-ins; every 15 minutes it sweeps again.
@@ -27,7 +27,7 @@ import hmac
 import logging
 import re
 from collections.abc import AsyncIterator, Callable
-from contextlib import asynccontextmanager
+from contextlib import AbstractAsyncContextManager, AsyncExitStack, asynccontextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -51,6 +51,7 @@ THREAD_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,79}")
 MAX_ATTACHMENTS = 100
 MAX_ATTACHMENT_BYTES = 200 * 1024 * 1024
 MAX_BATCH_BYTES = 256 * 1024 * 1024
+THREAD_PREFIXES = ("api-", "a2a-")
 
 
 class MessageIn(BaseModel):
@@ -141,16 +142,20 @@ def create_app(
     settings: Settings | None = None,
     *,
     build: Callable[..., LocalRuntime] = build_local_runtime,
+    channels: Callable[[FastAPI], AbstractAsyncContextManager[None]] | None = None,
 ) -> FastAPI:
     settings = settings or Settings()
     tokens = settings.access_token_callers_map()
-    if not tokens and not (settings.a2a_url and settings.a2a_allow_anonymous):
-        raise RuntimeError(
-            "INSIGHTFUL_REPORT_AGENT_ACCESS_TOKEN_CALLERS is empty: the API refuses to serve without callers"
+    register_nacos = bool(settings.nacos_url and settings.a2a_url)
+    if settings.nacos_url and not register_nacos:
+        _LOGGER.warning("Nacos registration skipped. Set INSIGHTFUL_REPORT_AGENT_A2A_URL.")
+    if not settings.a2a_url:
+        # Advertise a usable address when the listener binds a wildcard address.
+        host = {"0.0.0.0": "127.0.0.1", "::": "::1"}.get(settings.api_host, settings.api_host)  # noqa: S104
+        authority = f"[{host}]" if ":" in host and not host.startswith("[") else host
+        settings = settings.model_copy(
+            update={"a2a_url": f"http://{authority}:{settings.api_port}"}
         )
-    if settings.nacos_url and not settings.a2a_url:
-        raise ValueError("Nacos registration requires INSIGHTFUL_REPORT_AGENT_A2A_URL")
-    a2a_handler = None
     registry = None
 
     @asynccontextmanager
@@ -168,11 +173,9 @@ def create_app(
             def posted(thread_id: str, text: str) -> None:
                 asyncio.get_running_loop().create_task(holder[0].record_update(thread_id, text))
 
-            surface_middleware: tuple[Any, ...] = ()
-            if settings.a2a_url:
-                from insightful_report_agent.surfaces.a2a.progress import A2AProgressMiddleware
+            from insightful_report_agent.surfaces.a2a.progress import A2AProgressMiddleware
 
-                surface_middleware = (A2AProgressMiddleware(app.state.a2a_progress),)
+            surface_middleware = (A2AProgressMiddleware(app.state.a2a_progress),)
 
             runtime = build(
                 settings,
@@ -187,25 +190,29 @@ def create_app(
             )
             holder.append(ApiState(runtime=runtime, store=store, tokens=tokens))
             app.state.api = holder[0]
-            if a2a_handler is not None:
+            async with AsyncExitStack() as stack:
+                if runtime.binding.runner is not None:
+                    stack.callback(runtime.binding.runner.stop_all)
+                stack.push_async_callback(runtime.aclose)
+                stack.push_async_callback(a2a_handler.aclose)
                 await app.state.a2a_store.recover()
-            await maintenance.start(runtime, store)
-            keeper = asyncio.get_running_loop().create_task(
-                maintenance.run(runtime, store), name="maintenance"
-            )
-            try:
+                await maintenance.start(runtime, store, thread_prefix=THREAD_PREFIXES)
+                keeper = asyncio.create_task(
+                    maintenance.run(runtime, store, thread_prefix=THREAD_PREFIXES),
+                    name="api maintenance",
+                )
+
+                async def stop_maintenance() -> None:
+                    keeper.cancel()
+                    await asyncio.gather(keeper, return_exceptions=True)
+
+                stack.push_async_callback(stop_maintenance)
                 if registry is not None:
                     registry.start()
+                    stack.push_async_callback(registry.aclose)
+                if channels is not None:
+                    await stack.enter_async_context(channels(app))
                 yield
-            finally:
-                if registry is not None:
-                    await registry.aclose()
-                if a2a_handler is not None:
-                    await a2a_handler.aclose()
-                keeper.cancel()
-                await runtime.aclose()
-                if runtime.binding.runner is not None:
-                    runtime.binding.runner.stop_all()
 
     app = FastAPI(title="Insightful Report Agent", lifespan=lifespan, docs_url=None, redoc_url=None)
 
@@ -226,12 +233,13 @@ def create_app(
     ) -> MessageOut:
         await _owned(request, thread_id, caller, create=True)
         state: ApiState = request.app.state.api
-        added = await state.runtime.ask(body.text, thread_id=thread_id)
-        return MessageOut(
-            reply=final_text(added),
-            files=_files(state.runtime, thread_id),
-            working=state.runtime.busy(),
-        )
+        with state.runtime.trace.request(thread_id, "api", caller):
+            added = await state.runtime.ask(body.text, thread_id=thread_id)
+            return MessageOut(
+                reply=final_text(added),
+                files=_files(state.runtime, thread_id),
+                working=state.runtime.busy(),
+            )
 
     @app.post("/threads/{thread_id}/attachments")
     async def attach(
@@ -242,28 +250,26 @@ def create_app(
     ) -> dict[str, list[str]]:
         await _owned(request, thread_id, caller, create=True)
         state: ApiState = request.app.state.api
-        return {"paths": await state.runtime.attach(thread_id, await upload_batch(files))}
+        with state.runtime.trace.request(thread_id, "api", caller):
+            return {"paths": await state.runtime.attach(thread_id, await upload_batch(files))}
 
-    if settings.a2a_url:
+    @app.post("/a2a/contexts/{context_id}/attachments")
+    async def attach_context(
+        context_id: str,
+        request: Request,
+        files: list[UploadFile] = File(...),  # noqa: B008
+        caller: str = Depends(_caller),
+    ) -> dict[str, list[str]]:
+        from insightful_report_agent.surfaces.a2a.app import thread_for
 
-        @app.post("/a2a/contexts/{context_id}/attachments")
-        async def attach_context(
-            context_id: str,
-            request: Request,
-            files: list[UploadFile] = File(...),  # noqa: B008
-            caller: str = Depends(_caller),
-        ) -> dict[str, list[str]]:
-            from insightful_report_agent.surfaces.a2a.app import thread_for
-
-            if settings.a2a_allow_anonymous:
-                raise HTTPException(
-                    status_code=403, detail="context uploads require authenticated A2A"
-                )
-            if len(context_id) > 256 or not context_id.strip():
-                raise HTTPException(status_code=400, detail="invalid context id")
-            state: ApiState = request.app.state.api
-            thread_id = thread_for(caller, context_id)
-            await _owned(request, thread_id, caller, create=False)
+        if settings.a2a_allow_anonymous:
+            raise HTTPException(status_code=403, detail="context uploads require authenticated A2A")
+        if len(context_id) > 256 or not context_id.strip():
+            raise HTTPException(status_code=400, detail="invalid context id")
+        state: ApiState = request.app.state.api
+        thread_id = thread_for(caller, context_id)
+        await _owned(request, thread_id, caller, create=False)
+        with state.runtime.trace.request(thread_id, "a2a", caller):
             return {"paths": await state.runtime.attach(thread_id, await upload_batch(files))}
 
     @app.get("/threads/{thread_id}/updates", response_model=Updates)
@@ -280,7 +286,7 @@ def create_app(
 
     def file_caller(thread_id: str, request: Request) -> str:
         # Anonymous access covers A2A output files only, never ordinary HTTP threads.
-        if settings.a2a_url and settings.a2a_allow_anonymous and thread_id.startswith("a2a-"):
+        if settings.a2a_allow_anonymous and thread_id.startswith("a2a-"):
             return ANONYMOUS_A2A_CALLER
         return _caller(request)
 
@@ -296,12 +302,11 @@ def create_app(
             raise HTTPException(status_code=404, detail="no such file")
         return FileResponse(path, filename=path.name, headers={"X-Content-Type-Options": "nosniff"})
 
-    if settings.a2a_url:
-        from insightful_report_agent.surfaces.a2a.app import install_a2a
+    from insightful_report_agent.surfaces.a2a.app import install_a2a
 
-        a2a_handler = install_a2a(app, settings)
-        if settings.nacos_url:
-            from insightful_report_agent.surfaces.a2a.nacos import NacosRegistry
+    a2a_handler = install_a2a(app, settings)
+    if register_nacos:
+        from insightful_report_agent.surfaces.a2a.nacos import NacosRegistry
 
-            registry = NacosRegistry(settings, app.state.a2a_card)
+        registry = NacosRegistry(settings, app.state.a2a_card)
     return app

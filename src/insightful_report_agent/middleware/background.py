@@ -153,7 +153,7 @@ class BackgroundServices:
                 if box is not None:
                     await self.watchdog(box.target, False)
 
-    async def sweep(self, store: Any) -> int:
+    async def sweep(self, store: Any, *, thread_prefix: str | tuple[str, ...] = "") -> int:
         """Tell leads about helpers a restart killed or whose notice a restart swallowed."""
 
         async def on_task(key: str, value: dict[str, Any]) -> None:
@@ -188,7 +188,9 @@ class BackgroundServices:
         async def ignore(_key: str, _value: dict[str, Any]) -> None:
             return None
 
-        found = await ledger.sweep(store, on_task=on_task, on_wakeup=ignore)
+        found = await ledger.sweep(
+            store, on_task=on_task, on_wakeup=ignore, thread_prefix=thread_prefix
+        )
         for sweeper in self.sweepers:
             try:
                 found += await sweeper(store)

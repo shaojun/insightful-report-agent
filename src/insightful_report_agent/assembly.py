@@ -97,6 +97,12 @@ def build_agent_components(
     prompt = (root / "instructions.md").read_text(encoding="utf-8")
     if settings.preprocessor_docs_url:
         prompt += f"\nConfigured preprocessor documentation: {settings.preprocessor_docs_url}\n"
+    if not library.legacy and settings.preprocessor_api_url and settings.preprocessor_api_key:
+        prompt += (
+            "\nThe host submits uploaded raw files to the external preprocessor automatically. "
+            "Users may upload raw files or a prepared result ZIP. For URL or WebDAV references, "
+            "explain the external preprocessing handoff when the converted sources are missing.\n"
+        )
     if library.legacy:
         prompt += "\nThis thread uses legacy raw source intake. Follow the legacy tool descriptions.\n"
     return AgentComponents(

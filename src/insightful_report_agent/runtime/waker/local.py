@@ -98,13 +98,17 @@ class InProcessWaker:
         )
         self._timer_threads[schedule_id] = target.thread_id
 
-    async def restore(self, thread_id: str | None = None) -> int:
+    async def restore(
+        self, thread_id: str | None = None, *, thread_prefix: str | tuple[str, ...] = ""
+    ) -> int:
         """Re-arm the check-ins a previous process kept (one thread's, or all); returns how many."""
         if self.store is None:
             return 0
         restored = 0
         for item in await self.store.asearch(CHECK_INS, limit=1000):
             value = item.value
+            if not str(value.get("thread_id", "")).startswith(thread_prefix):
+                continue
             if item.key in self._timers or (
                 thread_id is not None and value.get("thread_id") != thread_id
             ):
@@ -118,6 +122,15 @@ class InProcessWaker:
             self._arm(item.key, target, at, str(value.get("message") or ""))
             restored += 1
         return restored
+
+    async def aclose(self) -> None:
+        """Cancel in-process work while leaving unclaimed check-ins in the store."""
+        tasks = [*self._timers.values(), *self._turns]
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        self._timers.clear()
+        self._timer_threads.clear()
 
     async def cancel(self, schedule_id: str) -> None:
         timer = self._timers.pop(schedule_id, None)

@@ -74,6 +74,21 @@ class Settings(BaseSettings):
     """Lead effort; unset uses the registry default for the model (`high` for Claude 5)."""
     source_input_mode: Literal["preprocessed", "legacy"] = "preprocessed"
     preprocessor_docs_url: str | None = None
+    preprocessor_api_url: str | None = None
+    preprocessor_api_key: SecretStr | None = Field(default=None, validation_alias="BRFP_API_KEY")
+    preprocessor_timeout_seconds: float = Field(default=3600, gt=0)
+    langfuse_url: str | None = Field(
+        default=None, validation_alias=_alias("LANGFUSE_BASE_URL", "LANGFUSE_HOST")
+    )
+    langfuse_public_key: SecretStr | None = Field(
+        default=None, validation_alias="LANGFUSE_PUBLIC_KEY"
+    )
+    langfuse_secret_key: SecretStr | None = Field(
+        default=None, validation_alias="LANGFUSE_SECRET_KEY"
+    )
+    langfuse_tracing_enabled: bool = Field(
+        default=True, validation_alias="LANGFUSE_TRACING_ENABLED"
+    )
     abstract_model: str | None = None
     abstract_model_base_url: str | None = None
     abstract_model_api_key_env: str | None = None
@@ -245,7 +260,7 @@ class Settings(BaseSettings):
     api_host: str = "127.0.0.1"
     api_port: int = Field(default=8787, ge=1, le=65535)
 
-    # An explicit reachable base URL enables the self-hosted A2A surface.
+    # Optional advertised A2A origin. The API listener supplies the default.
     a2a_url: str | None = None
     a2a_allow_anonymous: bool = False
     a2a_documentation_url: str | None = None
@@ -264,6 +279,11 @@ class Settings(BaseSettings):
         "model_effort",
         "mineru_api_token",
         "preprocessor_docs_url",
+        "preprocessor_api_url",
+        "preprocessor_api_key",
+        "langfuse_url",
+        "langfuse_public_key",
+        "langfuse_secret_key",
         "abstract_model",
         "abstract_model_base_url",
         "abstract_model_api_key_env",
