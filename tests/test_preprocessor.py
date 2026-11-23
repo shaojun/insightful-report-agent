@@ -48,7 +48,10 @@ async def test_preprocessor_terminal_state(monkeypatch, state):
         lambda **kwargs: client(**kwargs, transport=httpx.MockTransport(handle)),
     )
     if state == "partial":
-        name, data = await preprocess(settings, Observability(settings), {"资料.md": b"source"})
+        name, data, status = await preprocess(
+            settings, Observability(settings), {"资料.md": b"source"}
+        )
+        assert status == "partial"
         assert is_prepared(name, data)
         assert data == buffer.getvalue()
         assert calls[-1] == ("GET", "download")

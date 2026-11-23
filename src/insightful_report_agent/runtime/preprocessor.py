@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from io import BytesIO
+from typing import Literal
 from uuid import UUID
 from zipfile import BadZipFile, ZipFile
 
@@ -13,6 +14,11 @@ from insightful_report_agent.config import Settings
 from insightful_report_agent.runtime.observability import Observability
 
 MAX_RESULT_BYTES = 200 * 1024**2
+PreprocessStage = Literal["started", "succeeded", "partial"]
+
+
+class PreprocessorError(RuntimeError):
+    """The external service did not return a usable result."""
 
 
 def is_prepared(name: str, content: bytes) -> bool:
@@ -27,7 +33,7 @@ def is_prepared(name: str, content: bytes) -> bool:
 
 async def preprocess(
     settings: Settings, trace: Observability, files: dict[str, bytes]
-) -> tuple[str, bytes]:
+) -> tuple[str, bytes, Literal["succeeded", "partial"]]:
     transport = httpx.AsyncClient(
         base_url=settings.preprocessor_api_url,
         headers={"Authorization": f"Bearer {settings.preprocessor_api_key.get_secret_value()}"},
@@ -61,26 +67,29 @@ async def preprocess(
                         await asyncio.sleep(2)
                     if wait:
                         wait.update(output={"state": job["state"]})
-                    if not job["download_ready"] or job["state"] == "failed":
-                        raise RuntimeError("Preprocessing failed; no usable ZIP was returned")
+                    state = job["state"]
+                    if not job["download_ready"] or state == "failed":
+                        raise PreprocessorError("Preprocessing failed; no usable ZIP was returned")
                 with trace.span("preprocessor.download") as download:
                     result = bytearray()
                     async with transport.stream("GET", f"{path}/download") as response:
                         response.raise_for_status()
                         async for chunk in response.aiter_bytes():
                             if len(result) + len(chunk) > MAX_RESULT_BYTES:
-                                raise RuntimeError("Preprocessed ZIP exceeds 200 MiB")
+                                raise PreprocessorError("Preprocessed ZIP exceeds 200 MiB")
                             result.extend(chunk)
                     name = f"preprocessed-{job_id}.zip"
                     content = bytes(result)
                     if not is_prepared(name, content):
-                        raise RuntimeError("Preprocessor returned an invalid result ZIP")
+                        raise PreprocessorError("Preprocessor returned an invalid result ZIP")
                     if download:
                         download.update(output={"bytes": len(content)})
         except httpx.HTTPStatusError as error:
-            raise RuntimeError(f"Preprocessor HTTP {error.response.status_code}") from None
+            raise PreprocessorError(f"Preprocessor HTTP {error.response.status_code}") from None
         except (httpx.HTTPError, KeyError, ValueError, TypeError, TimeoutError):
-            raise RuntimeError("Preprocessor unavailable or returned an invalid response") from None
+            raise PreprocessorError(
+                "Preprocessor unavailable or returned an invalid response"
+            ) from None
         if span:
             span.update(output={"state": job["state"], "result_bytes": len(content)})
-        return name, content
+        return name, content, state

@@ -151,11 +151,17 @@ class SourceIntake:
         if not paths:
             await self.library.prepare_sources(self.binding.sandbox, records)
             return
-        selected = {r["id"] for r in records if r.get("container_path", r["path"]) in paths}
+        selected = {r["id"]: r for r in records if r.get("container_path", r["path"]) in paths}
         if not self.library.legacy:
             rows = await self.library.prepare_sources(self.binding.sandbox, records)
             await self._notify(
-                thread, "prepared", [row for row in rows if row["source_id"] in selected]
+                thread,
+                "prepared",
+                [
+                    {**row, "wiki_index": selected[row["source_id"]].get("wiki_index")}
+                    for row in rows
+                    if row["source_id"] in selected
+                ],
             )
             return
         await self._notify(thread, "normalizing", [])

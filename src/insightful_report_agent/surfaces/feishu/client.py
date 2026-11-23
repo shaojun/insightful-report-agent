@@ -6,13 +6,17 @@ import json
 import re
 import threading
 import time
+from io import BytesIO
 from typing import Any
+from zipfile import ZipFile, ZipInfo
 
 import httpx
 
 DOMAIN = "https://open.feishu.cn"
 MAX_DOWNLOAD_BYTES = 100 * 1024 * 1024
 MAX_UPLOAD_BYTES = 30 * 1024 * 1024
+MAX_FOLDER_ENTRIES = 100
+MAX_FOLDER_DEPTH = 16
 _ID = re.compile(r"^[A-Za-z0-9_-]{1,200}$")
 
 
@@ -20,10 +24,34 @@ class FeishuError(Exception):
     """A safe error code, without response text, URLs or request headers."""
 
 
+class FolderAttachmentError(FeishuError):
+    """A folder could not be read completely."""
+
+
 def identifier(value: str) -> str:
     if not _ID.fullmatch(value):
         raise FeishuError("invalid_identifier")
     return value
+
+
+def _folder_name(value: object) -> str:
+    if (
+        not isinstance(value, str)
+        or value in {"", ".", ".."}
+        or len(value.encode("utf-8", errors="surrogatepass")) > 240
+        or re.search(r"[/\\:\x00-\x1f\x7f\ud800-\udfff]", value)
+    ):
+        raise FolderAttachmentError("invalid_folder_entry_name")
+    return value
+
+
+def _folder_count(value: object) -> int:
+    # The API catalog describes counts as strings, while live responses also use numbers.
+    if (type(value) is int and value >= 0) or (
+        isinstance(value, str) and re.fullmatch(r"[0-9]{1,10}", value)
+    ):
+        return int(value)
+    raise FolderAttachmentError("invalid_folder_entry_count")
 
 
 class FeishuClient:
@@ -129,7 +157,66 @@ class FeishuClient:
             json={"content": json.dumps(card, ensure_ascii=False)},
         )
 
-    def download(self, message: str, key: str, kind: str) -> bytes:
+    def folder_zip(self, message: str, key: str, name: str) -> tuple[str, bytes]:
+        """Resolve a chat folder and package its file bytes for the existing ZIP intake."""
+        try:
+            message = identifier(message)
+            root = _folder_name(name)
+            path = f"/open-apis/im/v1/files/{identifier(key)}/folder"
+            body = self.call(
+                "GET", path, params={"srctype": "message", "srcid": message, "recursive": "true"}
+            )
+            data = body.get("data")
+            if not isinstance(data, dict):
+                raise FolderAttachmentError("invalid_folder_response")
+            files: list[tuple[str, str]] = []
+            seen: set[str] = set()
+
+            def collect(items: object, parent: str, depth: int) -> int:
+                if not isinstance(items, list) or depth > MAX_FOLDER_DEPTH:
+                    raise FolderAttachmentError("invalid_folder_tree")
+                start = len(seen)
+                for item in items:
+                    if not isinstance(item, dict) or type(item.get("is_folder")) is not bool:
+                        raise FolderAttachmentError("invalid_folder_entry")
+                    relative = f"{parent}/{_folder_name(item.get('name'))}"
+                    if relative in seen or len(seen) >= MAX_FOLDER_ENTRIES:
+                        raise FolderAttachmentError("duplicate_path_or_too_many_folder_entries")
+                    seen.add(relative)
+                    if item["is_folder"]:
+                        count = _folder_count(item.get("children_count", 0))
+                        descendants = collect(item.get("children", []), relative, depth + 1)
+                        if count > descendants:
+                            raise FolderAttachmentError("incomplete_folder_tree")
+                    else:
+                        files.append((relative, identifier(str(item.get("file_key") or ""))))
+                return len(seen) - start
+
+            count = collect(data.get("items", []), root, 1)
+            # With recursive=true the live API counts the root itself in all_count.
+            if _folder_count(data.get("all_count", count + 1)) > count + 1:
+                raise FolderAttachmentError("incomplete_folder_tree")
+            if not files:
+                raise FolderAttachmentError("empty_folder")
+            output = BytesIO()
+            with ZipFile(output, "w") as archive:
+                for relative, child in sorted(files):
+                    content = self.download(
+                        message, child, "file", max_bytes=MAX_DOWNLOAD_BYTES - output.tell()
+                    )
+                    # A fixed member timestamp keeps identical re-uploads content-addressable.
+                    archive.writestr(ZipInfo(relative), content)
+            if output.tell() > MAX_DOWNLOAD_BYTES:
+                raise FolderAttachmentError("folder_too_large")
+            return f"{root}.zip", output.getvalue()
+        except FolderAttachmentError:
+            raise
+        except FeishuError as error:
+            raise FolderAttachmentError(str(error)) from None
+
+    def download(
+        self, message: str, key: str, kind: str, *, max_bytes: int = MAX_DOWNLOAD_BYTES
+    ) -> bytes:
         path = f"/open-apis/im/v1/messages/{identifier(message)}/resources/{identifier(key)}"
         try:
             with self._http.stream(
@@ -139,7 +226,7 @@ class FeishuClient:
                     raise FeishuError(f"download_http_{response.status_code}")
                 content = bytearray()
                 for chunk in response.iter_bytes():
-                    if len(content) + len(chunk) > MAX_DOWNLOAD_BYTES:
+                    if len(content) + len(chunk) > max_bytes:
                         raise FeishuError("attachment_too_large")
                     content.extend(chunk)
                 if (

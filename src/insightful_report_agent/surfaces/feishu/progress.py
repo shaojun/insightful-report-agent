@@ -81,6 +81,11 @@ def step_phrase(name: str, args: Mapping[str, Any]) -> tuple[str, str]:
             return "正在查看工作区目录", "已查看工作区目录"
     if name == "publish_report" and args.get("validate_only") is True:
         return "正在校验报告排版与引用", "已校验报告排版与引用"
+    if (
+        name in {"write_file", "edit_file"}
+        and posixpath.basename(str(args.get("file_path") or "")) == "report-progress.md"
+    ):
+        return "正在更新报告写作进度", "已更新报告写作进度"
     return SOURCE_STEPS.get(name) or phrase(name, args)
 
 

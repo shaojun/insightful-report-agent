@@ -5,9 +5,10 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import logging
 import re
 import time
-from collections.abc import AsyncIterator, Callable, Mapping, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -26,7 +27,7 @@ from insightful_report_agent.harness.tasks import REGISTRY
 from insightful_report_agent.middleware.background import BackgroundServices
 from insightful_report_agent.middleware.watch_tools import WATCHES
 from insightful_report_agent.runtime.observability import Observability
-from insightful_report_agent.runtime.preprocessor import is_prepared, preprocess
+from insightful_report_agent.runtime.preprocessor import PreprocessStage, is_prepared, preprocess
 from insightful_report_agent.runtime.profiles import RuntimeProfile
 from insightful_report_agent.runtime.sandbox import SandboxBinding, select_binding
 from insightful_report_agent.runtime.source_intake import IntakeNotify, SourceIntake
@@ -37,6 +38,8 @@ from insightful_report_agent.tools.source_web import urls_from_text
 from insightful_report_agent.tools.sources import url_files
 
 Replies = Callable[[str, str], None]
+PreprocessNotify = Callable[[PreprocessStage, float], Awaitable[None]]
+_LOGGER = logging.getLogger(__name__)
 
 GRAPH_NAME = "insightful-report-agent"
 #: deepagents' own ceiling, as on MDA; `StepBudgetMiddleware` wraps a turn up just before it.
@@ -162,7 +165,13 @@ class LocalRuntime:
         if text and notices.should_post(text):
             self.replies(thread_id, text)
 
-    async def attach(self, thread_id: str, files: Sequence[tuple[str, bytes]]) -> list[str]:
+    async def attach(
+        self,
+        thread_id: str,
+        files: Sequence[tuple[str, bytes]],
+        *,
+        on_preprocess: PreprocessNotify | None = None,
+    ) -> list[str]:
         """Store original bytes in the thread. Same names with different content coexist."""
         with (
             self.trace.request(thread_id, self.surface),
@@ -171,10 +180,15 @@ class LocalRuntime:
             ),
         ):
             async with self._lock(thread_id):
-                return await self._attach(thread_id, files)
+                return await self._attach(thread_id, files, on_preprocess=on_preprocess)
 
     async def _attach(
-        self, thread_id: str, files: Sequence[tuple[str, bytes]], *, notify: bool = True
+        self,
+        thread_id: str,
+        files: Sequence[tuple[str, bytes]],
+        *,
+        notify: bool = True,
+        on_preprocess: PreprocessNotify | None = None,
     ) -> list[str]:
         from insightful_report_agent.tools.sources import URL_SUFFIX
 
@@ -200,11 +214,13 @@ class LocalRuntime:
             and self.settings.preprocessor_api_url
             and self.settings.preprocessor_api_key
         ):
-            placed = await self._preprocess_raw(thread_id, placed)
+            placed = await self._preprocess_raw(thread_id, placed, on_preprocess=on_preprocess)
         await self.source_intake.attach(thread_id, placed, notify=notify)
         return list(placed)
 
-    async def _preprocess_raw(self, thread: str, placed: dict[str, bytes]) -> dict[str, bytes]:
+    async def _preprocess_raw(
+        self, thread: str, placed: dict[str, bytes], *, on_preprocess: PreprocessNotify | None
+    ) -> dict[str, bytes]:
         raw, prepared = {}, {}
         for path, data in placed.items():
             target = prepared if is_prepared(path, data) else raw
@@ -221,7 +237,18 @@ class LocalRuntime:
             file = Path(path)
             name = file.name if file.name not in inputs else f"{file.parent.name}/{file.name}"
             inputs[name] = data
-        name, content = await preprocess(self.settings, self.trace, inputs)
+
+        async def announce(stage: PreprocessStage, elapsed: float) -> None:
+            if on_preprocess is not None:
+                try:
+                    await on_preprocess(stage, elapsed)
+                except Exception as error:  # noqa: BLE001 - notification cannot stop intake
+                    _LOGGER.warning("Preprocessor notification failed (%s)", type(error).__name__)
+
+        await announce("started", 0)
+        start = time.monotonic()
+        name, content, state = await preprocess(self.settings, self.trace, inputs)
+        await announce(state, time.monotonic() - start)
         prepared[f"/workspace/attachments/{hashlib.sha256(content).hexdigest()}/{name}"] = content
         return prepared
 

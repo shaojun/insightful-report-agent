@@ -20,33 +20,49 @@ from typing import Any
 from langchain.agents.middleware import AgentMiddleware
 from langchain.agents.middleware.types import AgentState, ToolCallRequest
 from langchain_core.messages import ToolMessage
+from langchain_core.runnables.config import var_child_runnable_config
 from langgraph.types import Command
 
 from insightful_report_agent.config import Settings
 from insightful_report_agent.harness import notices
 from insightful_report_agent.models.registry import ModelConfigurationError
 from insightful_report_agent.runtime.local import LocalRuntime, final_text
+from insightful_report_agent.runtime.preprocessor import PreprocessorError, PreprocessStage
 from insightful_report_agent.runtime.profiles import thread_id_from_config
 from insightful_report_agent.runtime.source_intake import IntakeStage
 from insightful_report_agent.surfaces.feishu.client import (
     MAX_UPLOAD_BYTES,
     FeishuClient,
     FeishuError,
+    FolderAttachmentError,
     identifier,
 )
-from insightful_report_agent.surfaces.feishu.progress import FeishuProgress
+from insightful_report_agent.surfaces.feishu.progress import FeishuProgress, duration
 from insightful_report_agent.tools.delivery import DeliveredFile, LocalOutputAdapter
-from insightful_report_agent.tools.files import read_bytes
+from insightful_report_agent.tools.files import WorkspaceError, read_bytes, workspace_path
 
 _LOGGER = logging.getLogger(__name__)
 _NAMESPACE = ("insightful_report_agent", "feishu", "ingress")
 _ABSTRACT_DELIVERY = ("insightful_report_agent", "feishu", "abstract_delivery")
+_REPORT_PROGRESS_DELIVERY = ("insightful_report_agent", "feishu", "report_progress_delivery")
 _DM_NAMESPACE = ("insightful_report_agent", "feishu", "dm_sessions")
 MAX_FILES = 10
 RECENT_MESSAGES = 256
 MAX_POST_CHARS = 3500
-_UNSUPPORTED_FOLDER = "unsupported_folder_attachment"
+PREVIEW_CHARS = 1600
 _FENCE = re.compile(r"^\s{0,3}(`{3,}|~{3,})(.*)$")
+
+
+def _markdown_post(text: str) -> dict:
+    return {"zh_cn": {"content": [[{"tag": "md", "text": text}]]}}
+
+
+def _file_preview(title: str, data: bytes) -> str:
+    text = data.decode("utf-8-sig")
+    if len(text) > PREVIEW_CHARS:
+        text = text[:PREVIEW_CHARS].rstrip() + "\n… 其余内容见附件"
+    # Keep untrusted text inside a literal preview. Attachments retain the original bytes.
+    return f"**{title}**\n\n```text\n{text.replace('`', '｀')}\n```"
 
 
 def _fence_state(text: str, state: tuple[str, int, str] | None) -> tuple[str, int, str] | None:
@@ -169,6 +185,9 @@ def message_content(message: Mapping[str, Any], bot: str) -> tuple[str, list[tup
     text = ""
     if kind == "text":
         text = str(content.get("text") or "")
+    elif kind == "folder" or (kind == "file" and content.get("is_folder") is True):
+        key = identifier(str(content.get("file_key") or ""))
+        files.append((key, str(content.get("file_name") or key), "folder"))
     elif kind in ("file", "image", "audio", "media"):
         image = kind == "image"
         key = str(content.get("image_key" if image else "file_key") or "")
@@ -208,10 +227,11 @@ def message_content(message: Mapping[str, Any], bot: str) -> tuple[str, list[tup
         for resource in content.get("files") or []:
             if not isinstance(resource, dict):
                 raise FeishuError("invalid_message_content")
-            if resource.get("is_folder"):
-                raise FeishuError(_UNSUPPORTED_FOLDER)
             key = identifier(str(resource.get("file_key") or ""))
-            files.append((key, str(resource.get("file_name") or f"{key}.bin"), "file"))
+            if resource.get("is_folder") is True:
+                files.append((key, str(resource.get("file_name") or key), "folder"))
+            else:
+                files.append((key, str(resource.get("file_name") or f"{key}.bin"), "file"))
     else:
         raise FeishuError("unsupported_message_type")
     for mention in message.get("mentions") or []:
@@ -236,6 +256,7 @@ class FeishuAdapter:
     _tasks: set[asyncio.Task[None]] = field(default_factory=set)
     _locks: dict[str, asyncio.Lock] = field(default_factory=dict)
     _progress: dict[str, FeishuProgress] = field(default_factory=dict)
+    _progress_delivery_locks: dict[str, asyncio.Lock] = field(default_factory=dict)
 
     def accepts(self, payload: Mapping[str, Any]) -> bool:
         return self.rejection_reason(payload) is None
@@ -351,6 +372,19 @@ class FeishuAdapter:
                     _LOGGER.warning("[feishu] receipt reaction unavailable: %s", error)
                 with self.runtime.trace.request(thread, "feishu", sender_id):
                     text, resources = message_content(message, self.bot)
+                    if any(kind == "folder" for _, _, kind in resources):
+                        settings = self.runtime.settings
+                        if settings.source_input_mode != "legacy" and not (
+                            settings.preprocessor_api_url and settings.preprocessor_api_key
+                        ):
+                            raise FolderAttachmentError("folder_preprocessor_not_configured")
+                        if self.enable_progress:
+                            try:
+                                await self.post(
+                                    thread, "已收到文件夹，正在读取目录和下载其中的文件。"
+                                )
+                            except FeishuError as error:
+                                _LOGGER.warning("[feishu] folder receipt unavailable: %s", error)
                     if text or not resources:
                         progress = FeishuProgress(
                             self.client, (chat, root), enabled=self.enable_progress
@@ -359,10 +393,23 @@ class FeishuAdapter:
                         await progress.start()
                     attached: list[tuple[str, bytes]] = []
                     for key, name, kind in resources:
-                        data = await asyncio.to_thread(self.client.download, mid, key, kind)
-                        attached.append((name, data))
+                        if kind == "folder":
+                            attached.append(
+                                await asyncio.to_thread(self.client.folder_zip, mid, key, name)
+                            )
+                        else:
+                            data = await asyncio.to_thread(self.client.download, mid, key, kind)
+                            attached.append((name, data))
                     if attached:
-                        await self.runtime.attach(thread, attached)
+
+                        async def on_preprocess(stage: PreprocessStage, elapsed: float) -> None:
+                            await self.notify_preprocessor(thread, stage, elapsed)
+
+                        await self.runtime.attach(
+                            thread,
+                            attached,
+                            on_preprocess=on_preprocess if self.enable_progress else None,
+                        )
                         if not text:
                             return
                     added = await self.runtime.ask(text or "(attachment)", thread_id=thread)
@@ -378,10 +425,19 @@ class FeishuAdapter:
                 _LOGGER.warning("[feishu] turn failed: %s", reason)
                 if progress is not None:
                     await progress.close(failed=True)
-                if reason == _UNSUPPORTED_FOLDER:
+                if isinstance(error, PreprocessorError):
+                    await self.post(thread, "外部预处理未返回可用的资料包。请重新发送附件以重试。")
+                elif reason == "folder_preprocessor_not_configured":
                     await self.post(
                         thread,
-                        "无法读取飞书文件夹附件。请将文件夹压缩为 ZIP，并和原来的报告要求一起重新发送。",
+                        "当前服务未启用原始资料预处理。请上传预处理完成的结果 ZIP 和报告要求。",
+                    )
+                elif reason == "empty_folder":
+                    await self.post(thread, "这个文件夹中没有可下载的文件。请补充资料后重新发送。")
+                elif isinstance(error, FolderAttachmentError):
+                    await self.post(
+                        thread,
+                        "未能完整读取飞书文件夹。请将文件夹压缩为 ZIP，并和原来的报告要求一起重新发送。",
                     )
                 else:
                     await self.post(
@@ -389,6 +445,18 @@ class FeishuAdapter:
                     )
             finally:
                 self._progress.pop(thread, None)
+
+    async def notify_preprocessor(
+        self, thread: str, stage: PreprocessStage, elapsed: float
+    ) -> None:
+        if stage == "started":
+            message = (
+                "即将把附件提交给外部预处理服务，进行文档解析和材料摘要。大批量资料可能需要几分钟。"
+            )
+        else:
+            status = "完成" if stage == "succeeded" else "部分完成"
+            message = f"外部预处理{status}，结果资料包已下载。耗时 {duration(elapsed)}，正在核对材料索引。"
+        await self.post(thread, message)
 
     async def notify_source_intake(self, thread: str, stage: IntakeStage, rows: list[dict]) -> None:
         messages = {
@@ -407,11 +475,12 @@ class FeishuAdapter:
         if not self.runtime.components.source_library.legacy:
             failures = [row for row in rows if "error" in row]
             message = f"预处理资料包检查完成。可用材料 {len(rows) - len(failures)} 项，失败 {len(failures)} 项。"
-            if failures:
-                message += "\n" + "\n".join(
-                    f"· {row['name']}: {row['error']}"[:300] for row in failures[:5]
-                )
+            indexes = sorted({row["wiki_index"] for row in rows if row.get("wiki_index")})
+            if failures and not indexes:
+                message += " 未找到通过检查的 wiki-index.md，请重新提交资料。"
             await self.post(thread, message)
+            for index in indexes:
+                await self._send_wiki_index(thread, target, index)
             return
         backend = self.runtime.binding.sandbox
         namespace = (*_ABSTRACT_DELIVERY, thread)
@@ -456,6 +525,84 @@ class FeishuAdapter:
                 message += " 已收到你的文字请求，接下来会继续处理。"
             await self.post(thread, message)
 
+    async def _send_wiki_index(self, thread: str, target: tuple[str, str], path: str) -> None:
+        try:
+            data = await read_bytes(
+                self.runtime.binding.sandbox, path, cap_mb=MAX_UPLOAD_BYTES // 1024**2
+            )
+            preview = _file_preview("wiki-index.md 预览", data)
+        except Exception as error:  # noqa: BLE001 - index delivery must not block the report
+            _LOGGER.warning("[feishu] wiki index read failed: %s", type(error).__name__)
+            await self.post(thread, "无法读取材料索引文件，已导入的材料可以继续用于报告。")
+            return
+        try:
+            await self.post(thread, preview)
+        except FeishuError as error:
+            _LOGGER.warning("[feishu] wiki index preview failed: %s", type(error).__name__)
+        try:
+            uuid = hashlib.sha256(
+                thread.encode() + path.encode() + hashlib.sha256(data).digest()
+            ).hexdigest()[:32]
+            await asyncio.to_thread(
+                self.client.send_file, *target, "wiki-index.md", data, uuid=uuid
+            )
+        except Exception as error:  # noqa: BLE001 - index delivery must not block the report
+            _LOGGER.warning("[feishu] wiki index delivery failed: %s", type(error).__name__)
+            await self.post(thread, "材料索引附件发送失败，已导入的材料可以继续用于报告。")
+
+    async def send_report_progress(self, thread: str, file_path: str) -> None:
+        if (
+            not self.enable_progress
+            or self.runtime is None
+            or not file_path.startswith("/workspace/projects/")
+        ):
+            return
+        try:
+            path = workspace_path(file_path)
+            target = target_of(thread, self.tenant)
+        except (WorkspaceError, FeishuError):
+            return
+        if target is None or not (
+            path.startswith("/workspace/projects/") and path.endswith("/report-progress.md")
+        ):
+            return
+
+        namespace = (*_REPORT_PROGRESS_DELIVERY, thread)
+        async with self._progress_delivery_locks.setdefault(thread, asyncio.Lock()):
+            try:
+                token = var_child_runnable_config.set({"configurable": {"thread_id": thread}})
+                try:
+                    data = await read_bytes(self.runtime.binding.sandbox, path, cap_mb=1)
+                finally:
+                    var_child_runnable_config.reset(token)
+                if not data.strip():
+                    return
+                saved = await self.store.aget(namespace, path)
+                previous = saved.value if saved else {}
+                digest = hashlib.sha256(data).hexdigest()
+                if previous.get("digest") == digest:
+                    return
+                revision = previous.get("revision", 0) + 1
+                preview = _file_preview(f"报告写作进度 · 第 {revision} 次更新", data)
+                uuid = hashlib.sha256(
+                    f"{thread}\0{path}\0{revision}\0{digest}".encode()
+                ).hexdigest()[:31]
+                await asyncio.to_thread(
+                    self.client.send,
+                    *target,
+                    "post",
+                    _markdown_post(preview),
+                    uuid=f"{uuid}0",
+                )
+                await asyncio.to_thread(
+                    self.client.send_file, *target, "report-progress.md", data, uuid=f"{uuid}1"
+                )
+                await self.store.aput(namespace, path, {"digest": digest, "revision": revision})
+            except Exception as error:  # noqa: BLE001 - a notification cannot stop report writing
+                _LOGGER.warning(
+                    "[feishu] report progress delivery failed: %s", type(error).__name__
+                )
+
     async def post(self, thread: str, text: str) -> None:
         target = target_of(thread, self.tenant)
         if target is None or not text or not notices.should_post(text):
@@ -465,7 +612,7 @@ class FeishuAdapter:
                 self.client.send,
                 *target,
                 "post",
-                {"zh_cn": {"content": [[{"tag": "md", "text": chunk}]]}},
+                _markdown_post(chunk),
             )
 
     def post_soon(self, thread: str, text: str) -> None:
@@ -495,23 +642,33 @@ class FeishuProgressMiddleware(AgentMiddleware):
         request: ToolCallRequest,
         handler: Callable[[ToolCallRequest], Awaitable[ToolMessage | Command[Any]]],
     ) -> ToolMessage | Command[Any]:
-        progress = self.adapter._progress.get(thread_id_from_config(request.runtime))
-        if progress is None:
-            return await handler(request)
+        thread = thread_id_from_config(request.runtime)
+        progress = self.adapter._progress.get(thread)
         name = str(request.tool_call.get("name") or "") if request.tool is not None else ""
-        step = await progress.begin(name, request.tool_call.get("args"))
+        args = request.tool_call.get("args") or {}
+        step = await progress.begin(name, args) if progress is not None else None
         try:
             result = await handler(request)
         except BaseException as error:
-            await progress.end(step, failed=True, error=type(error).__name__)
+            if progress is not None and step is not None:
+                await progress.end(step, failed=True, error=type(error).__name__)
             raise
-        await progress.end(
-            step,
-            failed=isinstance(result, ToolMessage) and result.status == "error",
-            error=result.content if isinstance(result, ToolMessage) else None,
-            name=name,
-            content=result.content if isinstance(result, ToolMessage) else None,
-        )
+        if progress is not None and step is not None:
+            await progress.end(
+                step,
+                failed=isinstance(result, ToolMessage) and result.status == "error",
+                error=result.content if isinstance(result, ToolMessage) else None,
+                name=name,
+                content=result.content if isinstance(result, ToolMessage) else None,
+            )
+        path = args.get("file_path")
+        if (
+            name in {"write_file", "edit_file"}
+            and isinstance(path, str)
+            and isinstance(result, ToolMessage)
+            and result.status == "success"
+        ):
+            await self.adapter.send_report_progress(thread, path)
         return result
 
 

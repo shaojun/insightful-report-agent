@@ -9,7 +9,7 @@ import os
 from email import policy
 from email.parser import BytesParser
 from pathlib import Path
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 from uuid import uuid4
 from zipfile import ZipFile
 
@@ -22,13 +22,14 @@ from PIL import Image
 
 from insightful_report_agent.config import Settings
 from insightful_report_agent.runtime.local import build_local_runtime
+from insightful_report_agent.runtime.preprocessor import PreprocessorError
 from insightful_report_agent.surfaces.feishu.app import (
     FeishuAdapter,
     FeishuFileDelivery,
     FeishuProgressMiddleware,
     thread_id_for,
 )
-from insightful_report_agent.surfaces.feishu.client import FeishuClient
+from insightful_report_agent.surfaces.feishu.client import FeishuClient, FolderAttachmentError
 from insightful_report_agent.tools.delivery import LocalOutputAdapter
 from insightful_report_agent.tools.mineru import MinerU
 from tests.scripted_model import RespondingChatModel, ScriptedChatModel, reply, tool_call
@@ -63,18 +64,296 @@ def event(mid: str, kind: str, body: dict, *, first: bool = False) -> dict:
     }
 
 
-async def test_feishu_dm_with_folder_replies_with_zip_instructions() -> None:
+@pytest.mark.skipif(os.getenv("INSIGHTFUL_DOCKER_TESTS") != "1", reason="requires report sandbox")
+async def test_feishu_sends_report_progress_during_writing(tmp_path):
     client = MagicMock(spec=FeishuClient)
+    client.send.return_value = "om_reply"
+    chat = f"oc_{uuid4().hex}"
+    path = "/workspace/projects/demo/report-progress.md"
+    initial = "# 写作进度\n\n第一章待起草。\n"
+    updated = initial.replace("待起草", "已完成")
+
+    def next_chapter(_):
+        assert client.send_file.call_count == 1
+        assert client.send_file.call_args.args == (
+            chat,
+            "om_first",
+            "report-progress.md",
+            initial.encode(),
+        )
+        return tool_call(
+            "write_file",
+            {"file_path": "/workspace/projects/demo/chapter-1.md", "content": "# Chapter"},
+        )
+
+    def checkpoint(_):
+        assert client.send_file.call_count == 1
+        return tool_call(
+            "edit_file", {"file_path": path, "old_string": "待起草", "new_string": "已完成"}
+        )
+
+    def retry_unchanged(_):
+        assert client.send_file.call_count == 2
+        assert client.send_file.call_args.args == (
+            chat,
+            "om_first",
+            "report-progress.md",
+            updated.encode(),
+        )
+        return tool_call(
+            "edit_file", {"file_path": path, "old_string": "已完成", "new_string": "已完成"}
+        )
+
+    def fail_edit(_):
+        assert client.send_file.call_count == 2
+        return tool_call(
+            "edit_file", {"file_path": path, "old_string": "不存在", "new_string": "更新"}
+        )
+
+    store = InMemoryStore()
+    adapter = FeishuAdapter(client, "cli_test", "tenant", "ou_bot", store=store)
+    lead = ScriptedChatModel(
+        steps=[
+            lambda _: tool_call("write_file", {"file_path": path, "content": initial}),
+            next_chapter,
+            checkpoint,
+            retry_unchanged,
+            fail_edit,
+            lambda _: reply("报告阶段性工作结束。"),
+        ]
+    )
+    runtime = build_local_runtime(
+        Settings(_env_file=None, workspace_root=tmp_path),
+        ROOT,
+        model=lead,
+        store=store,
+        surface="feishu",
+        surface_middleware=(FeishuProgressMiddleware(adapter),),
+    )
+    adapter.runtime = runtime
+    payload = event("om_first", "text", {"text": "撰写长报告"}, first=True)
+    payload["event"]["message"]["chat_id"] = chat
+    try:
+        await adapter.handle(payload)
+        assert client.send_file.call_count == 2
+        assert lead.call_count == 6
+        previews = [
+            item.args[3]["zh_cn"]["content"][0][0]["text"]
+            for item in client.send.call_args_list
+            if item.args[2] == "post" and "报告写作进度" in str(item.args[3])
+        ]
+        assert len(previews) == 2
+        assert "第 1 次更新" in previews[0] and "第一章待起草" in previews[0]
+        assert "第 2 次更新" in previews[1] and "第一章已完成" in previews[1]
+    finally:
+        await runtime.aclose()
+        runtime.binding.runner.stop_all()
+
+
+@pytest.mark.skipif(os.getenv("INSIGHTFUL_DOCKER_TESTS") != "1", reason="requires report sandbox")
+@pytest.mark.parametrize("state", ["succeeded", "partial", "failed", "prepared_zip"])
+async def test_feishu_external_preprocessor_status_and_index(tmp_path, monkeypatch, state):
+    failed = int(state == "partial")
+    index = (
+        f"# 资料索引\n\n已完成 1 个文件 · 处理失败 {failed} 个文件 · 未能接收 0 个来源\n\n"
+        "- memo.md — 摘要内容 · [摘要](memo.md.brief.md) · [正文](memo.md.export.md)\n"
+    )
+    if failed:
+        index += "- invalid.pdf — 解析失败\n"
+    archive = io.BytesIO()
+    with ZipFile(archive, "w") as result:
+        result.writestr("wiki-index.md", index)
+        result.writestr("memo.md.brief.md", "摘要内容")
+        result.writestr("memo.md.export.md", "# Memo\n\nEvidence.")
+    data = archive.getvalue()
+    actions = []
+    chat = f"oc_{uuid4().hex}"
+    client = MagicMock(spec=FeishuClient)
+    client.download.return_value = data if state == "prepared_zip" else b"raw source"
+    client.send.side_effect = lambda chat, root, kind, body: actions.append(
+        body["zh_cn"]["content"][0][0]["text"]
+    )
+
+    async def external(_settings, _trace, inputs):
+        assert inputs == {"memo.md": b"raw source"}
+        assert "即将把附件提交给外部预处理服务" in actions[-1]
+        actions.append("external request")
+        if state == "failed":
+            raise PreprocessorError("test failure")
+        return "result.zip", data, state
+
+    monkeypatch.setattr("insightful_report_agent.runtime.local.preprocess", external)
+    store = InMemoryStore()
+    adapter = FeishuAdapter(client, "cli_test", "tenant", "ou_bot", store=store)
+    lead = ScriptedChatModel(steps=[])
+    runtime = build_local_runtime(
+        Settings(
+            _env_file=None,
+            workspace_root=tmp_path,
+            preprocessor_api_url="https://preprocessor.example",
+            preprocessor_api_key="test-key",
+        ),
+        ROOT,
+        model=lead,
+        store=store,
+        surface="feishu",
+        source_intake_notify=adapter.notify_source_intake,
+    )
+    adapter.runtime = runtime
+    thread = thread_id_for("tenant", chat, "om_first")
+    filename = "result.zip" if state == "prepared_zip" else "memo.md"
+    payload = event(
+        "om_first", "file", {"file_key": "file_material", "file_name": filename}, first=True
+    )
+    payload["event"]["message"]["chat_id"] = chat
+    try:
+        await adapter.handle(payload)
+        if state == "failed":
+            assert "外部预处理未返回可用" in actions[-1]
+            client.send_file.assert_not_called()
+            return
+        await runtime.source_intake.wait_ready(thread)
+        assert lead.call_count == 0
+        if state == "prepared_zip":
+            assert not any("外部预处理" in action for action in actions)
+        else:
+            assert "外部预处理" + ("部分完成" if failed else "完成") in actions[2]
+            assert "耗时" in actions[2]
+        assert f"可用材料 1 项，失败 {failed} 项。" in actions[-2]
+        assert "wiki-index.md 预览" in actions[-1]
+        assert "摘要内容" in actions[-1]
+        client.send_file.assert_called_once()
+        assert client.send_file.call_args.args == (
+            chat,
+            "om_first",
+            "wiki-index.md",
+            index.encode(),
+        )
+    finally:
+        await runtime.aclose()
+        runtime.binding.runner.stop_all()
+
+
+@pytest.mark.parametrize("kind", ["folder", "post"])
+async def test_feishu_dm_downloads_folder_and_preserves_paths(kind: str) -> None:
+    contents = {"file_root": b"first", "file_nested": b"second"}
+
+    def platform(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path.endswith("/tenant_access_token/internal"):
+            return httpx.Response(
+                200, json={"code": 0, "tenant_access_token": "test-token", "expire": 7200}
+            )
+        assert request.headers["authorization"] == "Bearer test-token"
+        if path == "/open-apis/im/v1/files/file_folder/folder":
+            assert request.url.params == httpx.QueryParams(
+                {"srctype": "message", "srcid": "om_folder", "recursive": "true"}
+            )
+            return httpx.Response(
+                200,
+                json={
+                    "code": 0,
+                    "data": {
+                        "all_count": 4,
+                        "items": [
+                            {"file_key": "file_root", "name": "资料.md", "is_folder": False},
+                            {
+                                "name": "子目录",
+                                "is_folder": True,
+                                "children_count": "1",
+                                "children": [
+                                    {
+                                        "file_key": "file_nested",
+                                        "name": "资料.md",
+                                        "is_folder": False,
+                                    },
+                                ],
+                            },
+                        ],
+                    },
+                },
+            )
+        parent, key = path.rsplit("/", 1)
+        if parent == "/open-apis/im/v1/messages/om_folder/resources":
+            assert request.url.params["type"] == "file"
+            return httpx.Response(200, content=contents[key])
+        assert path in {
+            "/open-apis/im/v1/messages/om_folder/reactions",
+            "/open-apis/im/v1/messages",
+        }
+        return httpx.Response(200, json={"code": 0, "data": {"message_id": "om_reply"}})
+
     runtime = MagicMock()
+    runtime.settings = Settings(
+        _env_file=None,
+        preprocessor_api_url="https://preprocessor.example",
+        preprocessor_api_key="test-key",
+    )
+    runtime.attach = AsyncMock()
+    runtime.ask = AsyncMock(return_value=[AIMessage(content="已收到报告要求")])
+    client = FeishuClient("cli_test", "test-secret", transport=httpx.MockTransport(platform))
     adapter = FeishuAdapter(
-        client, "cli_test", "tenant", "ou_bot", runtime=runtime, store=InMemoryStore()
+        client,
+        "cli_test",
+        "tenant",
+        "ou_bot",
+        enable_progress=False,
+        runtime=runtime,
+        store=InMemoryStore(),
+    )
+    folder = {"file_key": "file_folder", "file_name": "材料", "is_folder": True}
+    text = "请基于这些材料写报告"
+    body = (
+        folder
+        if kind == "folder"
+        else {
+            "content": [[{"tag": "text", "text": text}]],
+            "files": [folder],
+        }
+    )
+    payload = event("om_folder", kind, body)
+    payload["event"]["message"]["chat_type"] = "p2p"
+
+    try:
+        await adapter.handle(payload)
+        await adapter.handle(payload)
+    finally:
+        client.close()
+
+    runtime.attach.assert_awaited_once()
+    thread, [(name, archive)] = runtime.attach.await_args.args
+    assert name == "材料.zip"
+    with ZipFile(io.BytesIO(archive)) as files:
+        assert {name: files.read(name) for name in files.namelist()} == {
+            "材料/资料.md": b"first",
+            "材料/子目录/资料.md": b"second",
+        }
+    if kind == "post":
+        runtime.ask.assert_awaited_once_with(text, thread_id=thread)
+    else:
+        runtime.ask.assert_not_awaited()
+
+
+async def test_feishu_dm_with_unreadable_folder_replies_with_zip_instructions() -> None:
+    client = MagicMock(spec=FeishuClient)
+    client.folder_zip.side_effect = FolderAttachmentError("incomplete_folder_tree")
+    runtime = MagicMock()
+    runtime.settings.source_input_mode = "legacy"
+    adapter = FeishuAdapter(
+        client,
+        "cli_test",
+        "tenant",
+        "ou_bot",
+        enable_progress=False,
+        runtime=runtime,
+        store=InMemoryStore(),
     )
     payload = event(
         "om_folder",
         "post",
         {
             "content": [[{"tag": "text", "text": "帮我写一份报告"}]],
-            "files": [{"file_name": "test-bulk-preprocess", "is_folder": True}],
+            "files": [{"file_key": "file_folder", "file_name": "材料", "is_folder": True}],
         },
     )
     payload["event"]["message"]["chat_type"] = "p2p"
@@ -87,7 +366,38 @@ async def test_feishu_dm_with_folder_replies_with_zip_instructions() -> None:
     assert (chat, root, kind) == ("oc_chat", "dm", "post")
     assert "ZIP" in body["zh_cn"]["content"][0][0]["text"]
     client.download.assert_not_called()
+    runtime.attach.assert_not_called()
     runtime.ask.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("name", "count", "error"),
+    [("..", 2, "invalid_folder_entry_name"), ("notes.md", 3, "incomplete_folder_tree")],
+)
+def test_feishu_folder_rejects_unsafe_or_incomplete_listing(name, count, error) -> None:
+    def platform(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/tenant_access_token/internal"):
+            return httpx.Response(
+                200, json={"code": 0, "tenant_access_token": "test-token", "expire": 7200}
+            )
+        assert request.url.path.endswith("/file_folder/folder")
+        return httpx.Response(
+            200,
+            json={
+                "code": 0,
+                "data": {
+                    "all_count": count,
+                    "items": [{"file_key": "file_one", "name": name, "is_folder": False}],
+                },
+            },
+        )
+
+    client = FeishuClient("cli_test", "test-secret", transport=httpx.MockTransport(platform))
+    try:
+        with pytest.raises(FolderAttachmentError, match=error):
+            client.folder_zip("om_folder", "file_folder", "材料")
+    finally:
+        client.close()
 
 
 @pytest.mark.skipif(
