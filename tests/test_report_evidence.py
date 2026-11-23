@@ -1,3 +1,4 @@
+import base64
 import importlib
 import json
 from pathlib import Path
@@ -6,7 +7,9 @@ import pytest
 from bs4 import BeautifulSoup
 
 
-def test_report_supports_many_evidence_blocks_including_charts_and_images(tmp_path: Path, monkeypatch) -> None:
+def test_report_supports_many_evidence_blocks_including_charts_and_images(
+    tmp_path: Path, monkeypatch
+) -> None:
     monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[1] / "workspace" / "tools"))
     renderer = importlib.import_module("source_report")
     monkeypatch.setattr(renderer, "CACHE", tmp_path)
@@ -32,6 +35,13 @@ def test_report_supports_many_evidence_blocks_including_charts_and_images(tmp_pa
     draft = " ".join(f"[[{source}#b{i:04d}]]" for i in range(1, 19))
     draft += f" [[{source}#b0001]]\n\n![Preview](source:{source}/a0001)\n\n"
     draft += f"```chart\n{chart}\n```\n"
+    process = {
+        "title": "Proposed rollout",
+        "steps": [
+            {"label": "Pilot", "detail": "<img src=remote>", "evidence": [f"[[{source}#b0001]]"]},
+            {"label": "Review", "detail": "Check results", "evidence": [f"[[{source}#b0021]]"]},
+        ],
+    }
     payload = {
         "draft": draft,
         "records": [{"id": source, "path": "/workspace/attachments/source.md", "sha256": "abc"}],
@@ -44,6 +54,12 @@ def test_report_supports_many_evidence_blocks_including_charts_and_images(tmp_pa
         "Orders are summarized for the supplied period only. The available observations are "
         "insufficient to infer a long-term trend. " + draft
     )
+    diagram = f"\n```process\n{json.dumps(process)}\n```\n"
+    with pytest.raises(ValueError, match="Rendered 2 of 3 requested visuals"):
+        renderer.Report(documents, 1024**2).render({**payload, "min_visuals": 3})
+    with pytest.raises(ValueError, match="Each process step requires 1–4 exact evidence citations"):
+        invalid = diagram.replace(f"[[{source}#b0021]]", "uncited")
+        renderer.Report(documents, 1024**2).render({**payload, "draft": payload["draft"] + invalid})
     report = renderer.Report(documents, 1024**2)
     payload["require_source_figures"] = True
     without_image = payload["draft"].replace(f"![Preview](source:{source}/a0001)", "")
@@ -51,11 +67,24 @@ def test_report_supports_many_evidence_blocks_including_charts_and_images(tmp_pa
         renderer.Report(documents, 1024**2).render({**payload, "draft": without_image})
     html = BeautifulSoup(report.render(payload), "html.parser")
     assert report.source_figures == 1
+    assert report.charts == 1
+    assert report.diagrams == 0
     assert len(html.select("section[id]")) == 20
     assert len(html.select("a.cite")) == 21
     assert all(html.find(id=link["href"][1:]) for link in html.select("a.cite"))
 
-    payload["draft"] += f"\n[[{source}#b0021]]"
-    html = BeautifulSoup(renderer.Report(documents, 1024**2).render(payload), "html.parser")
+    payload["draft"] += diagram
+    payload["min_visuals"] = 3
+    report = renderer.Report(documents, 1024**2)
+    html = BeautifulSoup(report.render(payload), "html.parser")
+    assert report.visuals == 3 and report.diagrams == 1
+    (image,) = html.select("img")
+    assert (
+        base64.b64decode(image["src"].removeprefix("data:image/jpeg;base64,")) == asset.read_bytes()
+    )
+    assert html.select_one("figure svg")
+    steps = html.select("figure ol.process > li")
+    assert [step.strong.text for step in steps] == ["Pilot", "Review"]
+    assert "<img src=remote>" in steps[0].text
     assert len(html.select("section[id]")) == 21
     assert all(html.find(id=link["href"][1:]) for link in html.select("a.cite"))

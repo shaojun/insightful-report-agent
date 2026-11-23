@@ -99,6 +99,14 @@ async def test_preprocessed_archive_to_html_without_provider_calls(tmp_path: Pat
         brief = tool_data(messages, "read_source_file_abstract")
         assert not brief["generated"]
         assert "Supplied brief" in brief["text"]
+        return tool_call("list_source_figures", {"file_path": state["id"]})
+
+    def figures(messages):
+        index = tool_data(messages, "list_source_figures")
+        assert index["total"] == 1 and index["next_cursor"] is None
+        figure = index["figures"][0]
+        assert figure["locator"].startswith("Export Markdown line 5")
+        state["figure_id"] = figure["id"]
         return tool_call("read_source_evidence", {"file_path": state["id"]})
 
     def write(messages):
@@ -109,7 +117,7 @@ async def test_preprocessed_archive_to_html_without_provider_calls(tmp_path: Pat
         draft = (
             "# Findings\n\nSales reached 42 units in the supplied observation period. "
             "The material covers one quarter and provides insufficient evidence for a trend. "
-            f"[[{source_id}#b0001]]\n\n![Original chart](source:{source_id}/a0001)"
+            f"[[{source_id}#b0001]]\n\n![Original chart](source:{source_id}/{state['figure_id']})"
         )
         return tool_call(
             "write_file", {"file_path": "/workspace/projects/report.md", "content": draft}
@@ -118,6 +126,7 @@ async def test_preprocessed_archive_to_html_without_provider_calls(tmp_path: Pat
     def delivered(messages):
         result = tool_data(messages, "publish_report")
         assert result["source_figures"] == 1
+        assert result["charts"] == result["diagrams"] == 0
         return reply(result["delivered"])
 
     lead = ScriptedChatModel(
@@ -126,8 +135,16 @@ async def test_preprocessed_archive_to_html_without_provider_calls(tmp_path: Pat
             coverage,
             source,
             evidence,
+            figures,
             write,
-            lambda _: tool_call("publish_report", {"draft_path": "/workspace/projects/report.md"}),
+            lambda _: tool_call(
+                "publish_report",
+                {
+                    "draft_path": "/workspace/projects/report.md",
+                    "min_visuals": 1,
+                    "require_source_figures": True,
+                },
+            ),
             delivered,
         ]
     )

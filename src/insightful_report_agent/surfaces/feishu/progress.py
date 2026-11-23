@@ -25,6 +25,7 @@ SOURCE_STEPS = {
     "list_sources": ("正在查看材料清单", "已查看材料清单"),
     "prepare_source_overview": ("正在核对材料预处理结果", "已核对材料预处理结果"),
     "synthesize_source_overview": ("正在综合本轮材料的高层摘要", "已生成材料综合总览"),
+    "list_source_figures": ("正在查找资料中的图", "已查看资料图清单"),
     "read_source_evidence": ("正在核对来源证据", "已读取原文证据"),
     "search_web": ("正在搜索公开资料", "已搜索公开资料"),
     "add_source_urls": ("正在收录补充网页", "已收录补充网页"),

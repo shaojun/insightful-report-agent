@@ -818,6 +818,25 @@ class SourceLibrary:
             await self.put(backend, path, result)
             return {key: val for key, val in result.items() if key not in {"rows", "index"}}
 
+        async def list_source_figures(
+            file_path: str,
+            runtime: ToolRuntime,
+            cursor: Annotated[int, Field(ge=0)] = 0,
+        ) -> dict:
+            """Find figures in a selected source, independently of text evidence filters. Use look on a returned path to inspect a figure before embedding it."""
+            backend = self.backend(runtime)
+            record = locate(await self.records(backend), file_path)
+            doc = await self.prepared_document(backend, record)
+            assets = doc["assets"]
+            page_size = 20
+            return {
+                "source_id": doc["id"],
+                "total": len(assets),
+                "figures": assets[cursor : cursor + page_size],
+                "warnings": doc["warnings"],
+                "next_cursor": cursor + page_size if cursor + page_size < len(assets) else None,
+            }
+
         async def read_source_evidence(
             file_path: str,
             runtime: ToolRuntime,
@@ -903,14 +922,16 @@ class SourceLibrary:
             runtime: ToolRuntime,
             validate_only: bool = False,
             require_source_figures: bool = False,
+            min_visuals: Annotated[int, Field(ge=0)] = 0,
         ) -> dict:
-            """Deliver the completed standalone HTML report. Use validate_only=true for local checks and require_source_figures=true when source illustrations are central to the analysis. Drafts must be Markdown under /workspace/projects/."""
+            """Deliver the standalone HTML report. Use validate_only=true to check rendering, min_visuals for the planned minimum number of images/charts/diagrams, and require_source_figures=true when source illustrations are central. Drafts must be Markdown under /workspace/projects/."""
             return await self.publish(
                 self.backend(runtime),
                 draft_path,
                 runtime,
                 validate_only=validate_only,
                 require_source_figures=require_source_figures,
+                min_visuals=min_visuals,
             )
 
         functions = [
@@ -918,6 +939,7 @@ class SourceLibrary:
             read_source_file_abstract,
             prepare_source_overview,
             synthesize_source_overview,
+            list_source_figures,
             read_source_evidence,
             publish_report,
         ]
@@ -937,6 +959,7 @@ class SourceLibrary:
         *,
         validate_only: bool = False,
         require_source_figures: bool = False,
+        min_visuals: int = 0,
     ) -> dict:
         path = workspace_path(draft_path)
         if not path.startswith("/workspace/projects/") or not path.lower().endswith(".md"):
@@ -1000,6 +1023,7 @@ class SourceLibrary:
                     "snapshot": corpus["snapshot"],
                     "limit": limit,
                     "require_source_figures": require_source_figures,
+                    "min_visuals": min_visuals,
                 },
             )
         )
@@ -1035,4 +1059,6 @@ class SourceLibrary:
             "citations": output["citations"],
             "visuals": output["visuals"],
             "source_figures": output["source_figures"],
+            "charts": output["charts"],
+            "diagrams": output["diagrams"],
         }

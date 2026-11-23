@@ -26,11 +26,17 @@ h2{margin-top:1.8em;padding-bottom:.35em;border-bottom:1px solid #d6e1e8}
 a{color:#14635d}.cite{white-space:nowrap;font-size:.82em;margin:0 .16em}
 figure{margin:1.3em 0;padding:1em;border:1px solid #d9e4e8;border-radius:.5em}
 img,svg{max-width:100%;height:auto;display:block;margin:auto}figcaption,.meta{color:#455962;font-size:.9em}
+.source-figure{display:block;padding:1em;border:1px solid #d9e4e8;border-radius:.5em}
+.source-figure .meta{display:block;margin-top:.6em;text-align:center}
+.process{display:grid;gap:1.4em;list-style:none;margin:1em 0 0;padding:0}
+.process li{position:relative;padding:.65em 1em;border-left:3px solid #176760;background:#eef5f4;overflow-wrap:anywhere}
+.process li+li::before{content:"↓";position:absolute;top:-1.65em;left:1em;color:#176760}
+.process li strong{display:block;color:#152b36}
 table{border-collapse:collapse;width:100%;display:block;overflow:auto}th,td{border:1px solid #d9e4e8;padding:.4em .65em;text-align:left}th{background:#e9f3f1}
 blockquote{border-left:3px solid #176760;padding-left:1em;margin-left:0}pre{white-space:pre-wrap;word-break:break-word;background:#f1f5f7;padding:1em}
 details{border-top:1px solid #dee6ea;padding:.55em 0;overflow-wrap:anywhere}
 summary{cursor:pointer}section[id]{scroll-margin:1em}section[id]:target{outline:2px solid #176760}
-@media print{main{margin:0;max-width:none;border:0;padding:0}figure{break-inside:avoid}}
+@media print{main{margin:0;max-width:none;border:0;padding:0}figure,.source-figure{break-inside:avoid}}
 """
 
 
@@ -38,9 +44,9 @@ def text(value: object) -> str:
     return html.escape(str(value), quote=True)
 
 
-def label(value: object, limit: int) -> str:
+def label(value: object, limit: int, field: str) -> str:
     if not isinstance(value, str) or not value.strip() or len(value) > limit:
-        raise ValueError("Chart labels must be nonempty and within their length limit")
+        raise ValueError(f"{field} requires 1–{limit} characters")
     return value
 
 
@@ -49,13 +55,18 @@ class Report:
         self.documents = documents
         self.limit = limit
         self.citations: dict[tuple[str, str], int] = {}
-        self.visuals = 0
         self.source_figures = 0
+        self.charts = 0
+        self.diagrams = 0
         self.asset_bytes = 0
         self.markdown = MarkdownIt("commonmark", {"html": False}).enable("table")
         self.markdown.renderer.rules["text"] = self.inline_text
         self.markdown.renderer.rules["image"] = self.image
         self.markdown.renderer.rules["fence"] = self.fence
+
+    @property
+    def visuals(self) -> int:
+        return self.source_figures + self.charts + self.diagrams
 
     def ref(self, source: str, block: str) -> str:
         doc = self.documents.get(source)
@@ -98,24 +109,32 @@ class Report:
         data = path.read_bytes()
         if not data.startswith(b"\xff\xd8\xff"):
             raise ValueError("Invalid JPEG asset")
-        self.visuals += 1
         self.source_figures += 1
         refs = " ".join(self.ref(source, block) for block in asset["blocks"][:3])
         caption = text(token.content or asset["locator"])
         src = base64.b64encode(data).decode()
-        return f'<img src="data:image/jpeg;base64,{src}" alt="{caption}" /><span class="meta">{caption} · {refs}</span>'
+        return (
+            f'<span class="source-figure"><img src="data:image/jpeg;base64,{src}" alt="{caption}" />'
+            f'<span class="meta">{caption} · {text(asset["locator"])} {refs}</span></span>'
+        )
 
     def fence(self, tokens, index, options, env):
         token = tokens[index]
-        if token.info.strip() != "chart":
+        kind = token.info.strip()
+        if kind not in {"chart", "process"}:
             from markdown_it.renderer import RendererHTML
 
             return RendererHTML().fence(tokens, index, options, env)
         spec = json.loads(token.content)
         if not isinstance(spec, dict):
-            raise ValueError("A chart requires a JSON object")
-        title = label(spec.get("title"), 150)
-        unit = label(spec.get("unit"), 40)
+            raise ValueError(f"A {kind} block requires a JSON object")
+        if kind == "process":
+            return self.process(spec)
+        return self.chart(spec)
+
+    def chart(self, spec: dict) -> str:
+        title = label(spec.get("title"), 150, "Chart title")
+        unit = label(spec.get("unit"), 40, "Chart unit")
         data = spec.get("data")
         if not isinstance(data, list) or not 1 <= len(data) <= 16:
             raise ValueError("A chart requires 1–16 labeled values")
@@ -123,7 +142,7 @@ class Report:
         for item in data:
             if not isinstance(item, dict):
                 raise ValueError("Each chart row requires label, value and evidence")
-            name = label(item.get("label"), 52)
+            name = label(item.get("label"), 52, "Chart label")
             value = item.get("value")
             if type(value) not in (int, float) or abs(value) > 1e100 or not math.isfinite(value):
                 raise ValueError("Chart requires finite numeric values")
@@ -151,7 +170,7 @@ class Report:
             f'<tr><th scope="row">{text(name)}</th><td>{text(value)} {text(unit)}</td><td>{ref}</td></tr>'
             for name, value, ref in rows
         )
-        self.visuals += 1
+        self.charts += 1
         return (
             f"<figure><figcaption><strong>{text(title)}</strong> · {text(unit)}</figcaption>"
             f'<svg viewBox="0 0 850 {height}" role="img" aria-label="{text(title)}" xmlns="http://www.w3.org/2000/svg">'
@@ -159,6 +178,33 @@ class Report:
             + "</svg><details><summary>Chart data and sources</summary><table>"
             "<thead><tr><th>Label</th><th>Value</th><th>Evidence</th></tr></thead>"
             f"<tbody>{values}</tbody></table></details></figure>"
+        )
+
+    def process(self, spec: dict) -> str:
+        title = label(spec.get("title"), 150, "Process title")
+        steps = spec.get("steps")
+        if not isinstance(steps, list) or not 2 <= len(steps) <= 12:
+            raise ValueError("A process diagram requires 2–12 steps")
+        rows = []
+        for step in steps:
+            if not isinstance(step, dict):
+                raise ValueError("Each process step requires label, detail and evidence")
+            name = label(step.get("label"), 80, "Step label")
+            detail = label(step.get("detail"), 360, "Step detail")
+            evidence = step.get("evidence")
+            if not isinstance(evidence, list) or not 1 <= len(evidence) <= 4:
+                raise ValueError("Each process step requires 1–4 exact evidence citations")
+            refs = []
+            for citation in evidence:
+                match = CITATION.fullmatch(str(citation))
+                if not match:
+                    raise ValueError("Each process step requires 1–4 exact evidence citations")
+                refs.append(self.ref(*match.groups()))
+            rows.append(f'<li><strong>{text(name)}</strong>{text(detail)} {" ".join(refs)}</li>')
+        self.diagrams += 1
+        return (
+            f'<figure><figcaption><strong>{text(title)}</strong></figcaption>'
+            f'<ol class="process">{"".join(rows)}</ol></figure>'
         )
 
     def render(self, payload: dict) -> str:
@@ -188,6 +234,12 @@ class Report:
             raise ValueError(
                 "Embed at least one relevant source figure with "
                 "![caption](source:source-id/asset-id), then review the report again."
+            )
+        minimum = payload.get("min_visuals", 0)
+        if self.visuals < minimum:
+            raise ValueError(
+                f"Rendered {self.visuals} of {minimum} requested visuals. "
+                "Embed the planned source figures, chart blocks or process diagrams."
             )
         if not self.citations:
             raise ValueError("Use valid inline evidence citations in the report")
@@ -282,6 +334,8 @@ def main() -> None:
                 "citations": len(report.citations),
                 "visuals": report.visuals,
                 "source_figures": report.source_figures,
+                "charts": report.charts,
+                "diagrams": report.diagrams,
             }
         )
     )
