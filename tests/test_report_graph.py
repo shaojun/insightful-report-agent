@@ -86,14 +86,10 @@ async def test_preprocessed_archive_to_html_without_provider_calls(tmp_path: Pat
         assert batch["total"] == 3
         assert len(batch["failed"]) == 2
         assert batch["sources"][0]["summary"] == "Reported Q4 results."
-        return tool_call("synthesize_source_overview", {})
+        state["id"] = batch["sources"][0]["id"]
+        return tool_call("read_source_file_abstract", {"file_path": state["id"], "level": "high"})
 
     state = {}
-
-    def source(messages):
-        assert tool_data(messages, "synthesize_source_overview")["reviewed"] == 1
-        state["id"] = tool_data(messages, "prepare_source_overview")["sources"][0]["id"]
-        return tool_call("read_source_file_abstract", {"file_path": state["id"], "level": "high"})
 
     def evidence(messages):
         brief = tool_data(messages, "read_source_file_abstract")
@@ -129,22 +125,30 @@ async def test_preprocessed_archive_to_html_without_provider_calls(tmp_path: Pat
         assert result["charts"] == result["diagrams"] == 0
         return reply(result["delivered"])
 
+    publish_args = {
+        "draft_path": "/workspace/projects/report.md",
+        "min_visuals": 1,
+        "require_source_figures": True,
+    }
+
+    def publish_validated(messages):
+        result = tool_data(messages, "publish_report")
+        assert result["validated"] is True and result["source_figures"] == 1
+        assert "delivered" not in result
+        return tool_call("publish_report", publish_args)
+
     lead = ScriptedChatModel(
         steps=[
             lambda _: tool_call("prepare_source_overview", {"cursor": 0}),
             coverage,
-            source,
             evidence,
             figures,
             write,
             lambda _: tool_call(
                 "publish_report",
-                {
-                    "draft_path": "/workspace/projects/report.md",
-                    "min_visuals": 1,
-                    "require_source_figures": True,
-                },
+                {**publish_args, "validate_only": True},
             ),
+            publish_validated,
             delivered,
         ]
     )

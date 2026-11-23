@@ -752,71 +752,8 @@ class SourceLibrary:
             """Open the full, snapshot-specific coverage catalog. For preprocessed sources it uses the supplied index entries without generating summaries."""
             backend = self.backend(runtime)
             records = await self.records(backend)
-            if not records:
-                raise ToolException("No source material has been registered")
-            root = self.overview_root(records)
-            rows = await self.covered_rows(backend, records)
-            successes = [row for row in rows if "synopsis" in row]
-            if not successes:
-                raise ToolException("No source was successfully understood")
-            index = fingerprint(rows)
-            path = f"{root}/corpus.json"
-            cached = await self.optional(backend, path)
-            if cached is not None and cached["index"] == index:
-                return {key: val for key, val in cached.items() if key not in {"rows", "index"}}
-            if self.legacy:
-                summaries = [
-                    row["source_id"]
-                    + " · "
-                    + row["name"]
-                    + "\n"
-                    + row["synopsis"]
-                    + ("\nCoverage notes: " + "; ".join(row["warnings"]) if row["warnings"] else "")
-                    for row in successes
-                ]
-                overview = await self.reduce(
-                    summaries, f"{COMPACT_BOUNDARY}\n{CORPUS_PROMPT}", cap=4600, omit_citations=True
-                )
-            else:
-                overview = (
-                    f"{len(successes)}/{len(rows)} sources have an export and brief. "
-                    "Read the coverage catalog for the original index summaries and linked briefs."
-                )
-            catalog = f"{root}/catalog.md"
-            await self.save(
-                backend,
-                catalog,
-                (
-                    "# Source coverage\n\n"
-                    + "\n\n".join(
-                        f"## {row['source_id']} · {row['name']}\n"
-                        + (
-                            f"Processing failed: {row['error']}"
-                            if "error" in row
-                            else row["synopsis"]
-                            + f"\n\nBrief path: {row['path']}"
-                            + (
-                                "\n\nCoverage notes: " + "; ".join(row["warnings"])
-                                if row["warnings"]
-                                else ""
-                            )
-                        )
-                        for row in rows
-                    )
-                ).encode(),
-            )
-            result = {
-                "snapshot": self.snapshot(records),
-                "catalog": catalog,
-                "overview": overview,
-                "reviewed": len(successes),
-                "failed": len(rows) - len(successes),
-                "source_count": len(rows),
-                "index": index,
-                "rows": rows,
-            }
-            await self.put(backend, path, result)
-            return {key: val for key, val in result.items() if key not in {"rows", "index"}}
+            corpus = await self.corpus_overview(backend, records)
+            return {key: val for key, val in corpus.items() if key not in {"rows", "index"}}
 
         async def list_source_figures(
             file_path: str,
@@ -951,6 +888,77 @@ class SourceLibrary:
             StructuredTool.from_function(coroutine=fn, handle_tool_error=True) for fn in functions
         ]
 
+    async def corpus_overview(
+        self, backend: Any, records: list[dict], *, create: bool = True
+    ) -> dict:
+        if not records:
+            raise ToolException("No source material has been registered")
+        root = self.overview_root(records)
+        rows = await self.covered_rows(backend, records)
+        successes = [row for row in rows if "synopsis" in row]
+        if not successes:
+            raise ToolException("No source was successfully understood")
+        index = fingerprint(rows)
+        path = f"{root}/corpus.json"
+        cached = await self.optional(backend, path)
+        if cached is not None and cached["index"] == index:
+            return cached
+        if not create:
+            raise ToolException("Call synthesize_source_overview for the current snapshot before publishing")
+        if self.legacy:
+            summaries = [
+                row["source_id"]
+                + " · "
+                + row["name"]
+                + "\n"
+                + row["synopsis"]
+                + ("\nCoverage notes: " + "; ".join(row["warnings"]) if row["warnings"] else "")
+                for row in successes
+            ]
+            overview = await self.reduce(
+                summaries, f"{COMPACT_BOUNDARY}\n{CORPUS_PROMPT}", cap=4600, omit_citations=True
+            )
+        else:
+            overview = (
+                f"{len(successes)}/{len(rows)} sources have an export and brief. "
+                "Read the coverage catalog for the original index summaries and linked briefs."
+            )
+        catalog = f"{root}/catalog.md"
+        await self.save(
+            backend,
+            catalog,
+            (
+                "# Source coverage\n\n"
+                + "\n\n".join(
+                    f"## {row['source_id']} · {row['name']}\n"
+                    + (
+                        f"Processing failed: {row['error']}"
+                        if "error" in row
+                        else row["synopsis"]
+                        + f"\n\nBrief path: {row['path']}"
+                        + (
+                            "\n\nCoverage notes: " + "; ".join(row["warnings"])
+                            if row["warnings"]
+                            else ""
+                        )
+                    )
+                    for row in rows
+                )
+            ).encode(),
+        )
+        result = {
+            "snapshot": self.snapshot(records),
+            "catalog": catalog,
+            "overview": overview,
+            "reviewed": len(successes),
+            "failed": len(rows) - len(successes),
+            "source_count": len(rows),
+            "index": index,
+            "rows": rows,
+        }
+        await self.put(backend, path, result)
+        return result
+
     async def publish(
         self,
         backend: Any,
@@ -965,11 +973,7 @@ class SourceLibrary:
         if not path.startswith("/workspace/projects/") or not path.lower().endswith(".md"):
             raise ToolException("Draft must be a .md file under /workspace/projects/")
         records = await self.records(backend)
-        corpus = await self.optional(backend, f"{self.overview_root(records)}/corpus.json")
-        if corpus is None or corpus["index"] != fingerprint(
-            await self.covered_rows(backend, records)
-        ):
-            raise ToolException("Complete the current corpus overview before publishing")
+        corpus = await self.corpus_overview(backend, records, create=not self.legacy)
         try:
             draft = (await read_bytes(backend, path, cap_mb=2)).decode()
         except (WorkspaceError, UnicodeError):

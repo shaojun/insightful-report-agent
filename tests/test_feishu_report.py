@@ -795,7 +795,7 @@ async def test_feishu_multiple_messages_and_files_to_rich_report(tmp_path: Path)
         assert cards and "处理完成" in cards[-1]["header"]["title"]["content"]
         last_card = json.dumps(cards[-1], ensure_ascii=False)
         for step in (
-            "已综合 2 份材料的高层摘要",
+            "已核对 2 份材料的资料总览",
             "已读取高层摘要",
             "已生成中层摘要",
             "已读取中层摘要",

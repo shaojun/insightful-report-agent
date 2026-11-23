@@ -104,6 +104,10 @@ def failure_reason(error: object) -> str:
     """Classify evidence into fixed text; tool output may contain secrets or user data."""
     text = str(error).lower()
     for needles, reason in (
+        (
+            ("call synthesize_source_overview for the current snapshot before publishing",),
+            "当前资料总览尚未建立，需先更新资料总览再校验报告",
+        ),
         (("cancellederror",), "任务被取消或应用停止"),
         (("timeout", "timed out"), "操作超时"),
         (
@@ -189,7 +193,7 @@ class FeishuProgress:
                 else:
                     reviewed = result.get("reviewed")
                     if type(reviewed) is int and 0 < reviewed <= 1_000_000:
-                        step.done = f"已综合 {reviewed} 份材料的高层摘要"
+                        step.done = f"已核对 {reviewed} 份材料的资料总览"
         self._schedule()
 
     def _schedule(self) -> None:
