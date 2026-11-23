@@ -1,0 +1,337 @@
+"""The local runtime: the CLI, the offline demo and the test suite compile the shared assembly
+with `create_deep_agent`, an in-memory checkpointer and a local sandbox binding."""
+
+from __future__ import annotations
+
+import asyncio
+import hashlib
+import re
+import time
+from collections.abc import AsyncIterator, Callable, Mapping, Sequence
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+from deepagents import create_deep_agent
+from langchain_core.language_models import BaseChatModel
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
+from langchain_core.tools import BaseTool
+from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.store.memory import InMemoryStore
+
+from insightful_report_agent.assembly import AgentComponents, build_agent_components
+from insightful_report_agent.config import Settings
+from insightful_report_agent.harness import notices
+from insightful_report_agent.harness.tasks import REGISTRY
+from insightful_report_agent.middleware.background import BackgroundServices
+from insightful_report_agent.middleware.watch_tools import WATCHES
+from insightful_report_agent.runtime.profiles import RuntimeProfile
+from insightful_report_agent.runtime.sandbox import SandboxBinding, select_binding
+from insightful_report_agent.runtime.source_intake import IntakeNotify, SourceIntake
+from insightful_report_agent.runtime.waker.local import InProcessWaker
+from insightful_report_agent.tools.delivery import DeliveryAdapter, LocalOutputAdapter
+from insightful_report_agent.tools.mcp import McpServer
+from insightful_report_agent.tools.source_web import urls_from_text
+from insightful_report_agent.tools.sources import url_files
+
+Replies = Callable[[str, str], None]
+
+GRAPH_NAME = "insightful-report-agent"
+#: deepagents' own ceiling, as on MDA; `StepBudgetMiddleware` wraps a turn up just before it.
+DEFAULT_RECURSION_LIMIT = 9_999
+
+
+def local_profile(
+    project_root: Path,
+    binding: SandboxBinding,
+    out_dir: Path,
+    services: BackgroundServices | None = None,
+    *,
+    slack: Any = None,
+    surface: str = "cli",
+    delivery: DeliveryAdapter | None = None,
+    surface_middleware: tuple[Any, ...] = (),
+) -> RuntimeProfile:
+    return RuntimeProfile(
+        name="local",
+        slack=slack,
+        surface=surface,
+        surface_middleware=surface_middleware,
+        project_root=project_root,
+        backend_for=binding.backend_for,
+        staging_for=binding.staging_for,
+        delivery=delivery or LocalOutputAdapter(out_dir),
+        services=services,
+    )
+
+
+def compile_graph(
+    components: AgentComponents,
+    binding: SandboxBinding,
+    *,
+    checkpointer: Any | None = None,
+    store: Any | None = None,
+) -> Any:
+    return create_deep_agent(
+        model=components.model,
+        tools=list(components.tools),
+        system_prompt=components.system_prompt,
+        middleware=list(components.middleware),
+        subagents=list(components.subagents) or None,
+        skills=list(components.skills),
+        backend=binding.graph_backend,
+        interrupt_on=dict(components.interrupt_on) or None,
+        checkpointer=checkpointer if checkpointer is not None else InMemorySaver(),
+        store=store if store is not None else InMemoryStore(),
+        name=GRAPH_NAME,
+    )
+
+
+@dataclass
+class LocalRuntime:
+    settings: Settings
+    project_root: Path
+    binding: SandboxBinding
+    components: AgentComponents
+    graph: Any
+    out_dir: Path
+    waker: InProcessWaker
+    services: BackgroundServices
+    replies: Replies
+    source_intake: SourceIntake
+    _locks: dict[str, asyncio.Lock] = field(default_factory=dict)
+
+    def _config(self, thread_id: str, extra: Mapping[str, Any] | None = None) -> dict[str, Any]:
+        return {
+            "configurable": {**(extra or {}), "thread_id": thread_id},
+            "recursion_limit": DEFAULT_RECURSION_LIMIT,
+        }
+
+    def _lock(self, thread_id: str) -> asyncio.Lock:
+        return self._locks.setdefault(thread_id, asyncio.Lock())
+
+    async def ask(
+        self, message: str, *, thread_id: str, configurable: Mapping[str, Any] | None = None
+    ) -> list[BaseMessage]:
+        """Run one turn and return the messages it added. `configurable` carries what a surface
+        knows about the request (the Slack adapter's event)."""
+        async with self._lock(thread_id):
+            return await self._turn(thread_id, message, configurable)
+
+    async def _turn(
+        self, thread_id: str, message: str, configurable: Mapping[str, Any] | None = None
+    ) -> list[BaseMessage]:
+        if self.components.source_library.legacy and (urls := urls_from_text(message)):
+            await self._attach(thread_id, url_files(urls), notify=False)
+        if configurable and configurable.get("sources_only"):
+            count = int(configurable["sources_only"])
+            return [
+                AIMessage(
+                    content=(
+                        f"已收录 {count} 项材料，正在后台解析并生成概览摘要。"
+                        "可以继续上传，或发来报告目标。"
+                        if self.components.source_library.legacy
+                        else f"已收到 {count} 个附件，正在检查预处理资料包。可以继续上传，或发来报告目标。"
+                    )
+                )
+            ]
+        await self.source_intake.wait_ready(thread_id)
+        config = self._config(thread_id, configurable)
+        before = await self._message_count(config)
+        result = await self.graph.ainvoke(
+            {"messages": [HumanMessage(content=message)]}, config=config
+        )
+        messages: list[BaseMessage] = list(result.get("messages", []))
+        return messages[before:]
+
+    async def wake_turn(self, thread_id: str, message: str, started: asyncio.Event) -> None:
+        """A turn the waker started: after the person's own turn on the thread, never during it."""
+        async with self._lock(thread_id):
+            started.set()
+            added = await self._turn(thread_id, message)
+        text = final_text(added)
+        if text and notices.should_post(text):
+            self.replies(thread_id, text)
+
+    async def attach(self, thread_id: str, files: Sequence[tuple[str, bytes]]) -> list[str]:
+        """Store original bytes in the thread. Same names with different content coexist."""
+        async with self._lock(thread_id):
+            return await self._attach(thread_id, files)
+
+    async def _attach(
+        self, thread_id: str, files: Sequence[tuple[str, bytes]], *, notify: bool = True
+    ) -> list[str]:
+        from insightful_report_agent.tools.sources import URL_SUFFIX
+
+        placed = {}
+        for name, content in files:
+            clean = Path(name.replace("\\", "/")).name
+            clean = re.sub(r"[\x00-\x1f\x7f]", "_", clean).strip()
+            clean = clean if clean not in {"", ".", ".."} else "attachment"
+            # Match the filesystem limit without dropping the file extension.
+            if len(clean.encode()) > 240:
+                path = Path(clean)
+                suffix = path.suffix.encode()[:30].decode(errors="ignore")
+                clean = path.stem.encode()[:200].decode(errors="ignore") + suffix
+            if clean.endswith(URL_SUFFIX):
+                folder = "web"
+            else:
+                folder = hashlib.sha256(content).hexdigest()
+            placed[f"/workspace/attachments/{folder}/{clean}"] = content
+        if not placed:
+            return []
+        await self.source_intake.attach(thread_id, placed, notify=notify)
+        return list(placed)
+
+    def busy(self) -> bool:
+        """Whether a helper, watch, check-in or woken turn is outstanding on this runtime's threads."""
+        threads = list(self._locks)
+        return (
+            bool(self.source_intake.tasks)
+            or any(r.status == "running" and r.thread_id in threads for r in REGISTRY.values())
+            or any(w.status == "watching" for thread in threads for w in WATCHES.list(thread))
+            or self.waker.pending() > 0
+            or any(
+                b.delivery is not None and not b.delivery.done()
+                for b in self.services.inbox.boxes.values()
+            )
+        )
+
+    def thread_busy(self, thread_id: str) -> bool:
+        """Job completion for one API caller must not wait on other callers' jobs."""
+        box = self.services.inbox.box(thread_id)
+        lock = self._locks.get(thread_id)
+        return (
+            thread_id in self.source_intake.tasks
+            or any(r.status == "running" and r.thread_id == thread_id for r in REGISTRY.values())
+            or any(w.status == "watching" for w in WATCHES.list(thread_id))
+            or self.waker.pending(thread_id) > 0
+            or bool(box and box.delivery is not None and not box.delivery.done())
+            or bool(lock and lock.locked())
+        )
+
+    def sandbox_busy(self, container_name: str) -> bool:
+        """Protect active threads and restored check-ins before the sandbox is accessed again."""
+        runner = self.binding.runner
+        if runner is None:
+            return False
+        threads = set(self._locks) | self.waker.pending_threads() | self.source_intake.tasks.keys()
+        return any(
+            runner.names_for(thread)[0] == container_name and self.thread_busy(thread)
+            for thread in threads
+        )
+
+    async def settle(self, *, timeout_seconds: float = 6 * 3600, poll_seconds: float = 2.0) -> bool:
+        """Wait until nothing is outstanding (`busy`), so the CLI stays open while a job runs.
+        Returns False on timeout."""
+        deadline = time.monotonic() + timeout_seconds
+        while time.monotonic() < deadline:
+            if not self.busy():
+                return True
+            await asyncio.sleep(poll_seconds)
+        return False
+
+    async def stream(self, message: str, *, thread_id: str) -> AsyncIterator[dict[str, Any]]:
+        async with self._lock(thread_id):
+            if self.components.source_library.legacy and (urls := urls_from_text(message)):
+                await self._attach(thread_id, url_files(urls), notify=False)
+            await self.source_intake.wait_ready(thread_id)
+            async for chunk in self.graph.astream(
+                {"messages": [HumanMessage(content=message)]},
+                config=self._config(thread_id),
+                stream_mode="updates",
+            ):
+                yield chunk
+
+    async def aclose(self) -> None:
+        await self.source_intake.aclose()
+        await self.services.aclose()
+
+    async def _message_count(self, config: Mapping[str, Any]) -> int:
+        state = await self.graph.aget_state(config)
+        return len((state.values or {}).get("messages", [])) if state else 0
+
+
+def final_text(messages: list[BaseMessage]) -> str:
+    for message in reversed(messages):
+        if isinstance(message, AIMessage) and message.content and not message.tool_calls:
+            return message.text if hasattr(message, "text") else str(message.content)
+    return ""
+
+
+def build_local_runtime(
+    settings: Settings,
+    project_root: Path,
+    *,
+    model: BaseChatModel | None = None,
+    role_models: Mapping[str, BaseChatModel] | None = None,
+    binding: SandboxBinding | None = None,
+    out_dir: Path | None = None,
+    replies: Replies | None = None,
+    checkpointer: Any | None = None,
+    store: Any | None = None,
+    mcp_servers: Sequence[McpServer] = (),
+    mcp_tools: Sequence[BaseTool] = (),
+    slack: Any = None,
+    surface: str = "cli",
+    delivery: DeliveryAdapter | None = None,
+    surface_middleware: tuple[Any, ...] = (),
+    source_intake_notify: IntakeNotify | None = None,
+) -> LocalRuntime:
+    """Select the sandbox, assemble the components, compile the graph and wire the waker.
+
+    MCP tools are loaded by the caller (`tools.mcp.load_mcp_tools`, async) and passed in."""
+    chosen = binding if binding is not None else select_binding(settings, project_root)
+    workspace_root = (
+        settings.workspace_root
+        if settings.workspace_root.is_absolute()
+        else project_root / settings.workspace_root
+    )
+    out = out_dir if out_dir is not None else workspace_root / "out"
+    holder: list[LocalRuntime] = []
+
+    async def run_turn(thread_id: str, message: str, started: asyncio.Event) -> None:
+        await holder[0].wake_turn(thread_id, message, started)
+
+    store = store if store is not None else InMemoryStore()
+    waker = InProcessWaker(run_turn, store=store)
+    services = BackgroundServices(waker=waker, capture_target=waker.capture)
+    profile = local_profile(
+        project_root,
+        chosen,
+        out,
+        services,
+        slack=slack,
+        surface=surface,
+        delivery=delivery,
+        surface_middleware=surface_middleware,
+    )
+    components = build_agent_components(
+        settings=settings,
+        runtime=profile,
+        model=model,
+        role_models=role_models,
+        mcp_servers=mcp_servers,
+        mcp_tools=mcp_tools,
+    )
+    runtime = LocalRuntime(
+        settings=settings,
+        project_root=project_root,
+        binding=chosen,
+        components=components,
+        graph=compile_graph(components, chosen, checkpointer=checkpointer, store=store),
+        out_dir=out,
+        waker=waker,
+        services=services,
+        replies=replies or (lambda _thread, text: print(text)),
+        source_intake=SourceIntake(
+            chosen,
+            components.manifest,
+            components.source_library,
+            store,
+            surface,
+            notify=source_intake_notify,
+        ),
+    )
+    holder.append(runtime)
+    return runtime
