@@ -129,6 +129,72 @@ async def test_feishu_post_batches_pdf_attachments(monkeypatch, count, batch_byt
         runtime.ask.assert_awaited_once_with(prompt, thread_id=thread)
 
 
+async def test_feishu_dm_reminds_user_while_attachment_waits_for_active_turn():
+    client = MagicMock(spec=FeishuClient)
+    client.download.return_value = b"extra material"
+    runtime = MagicMock()
+    runtime.attach = AsyncMock()
+    started = asyncio.Event()
+    finish = asyncio.Event()
+    reminder = asyncio.Event()
+    loop = asyncio.get_running_loop()
+
+    async def ask(text, *, thread_id):
+        if text == "write a report":
+            started.set()
+            await finish.wait()
+        return [AIMessage(content="收到")]
+
+    def post(_chat, _root, _kind, body):
+        if "新附件会在本轮结束后" in body["zh_cn"]["content"][0][0]["text"]:
+            loop.call_soon_threadsafe(reminder.set)
+
+    client.send.side_effect = post
+    runtime.ask = AsyncMock(side_effect=ask)
+    adapter = FeishuAdapter(client, "cli_test", "tenant", "ou_bot", False, runtime, InMemoryStore())
+
+    async def send(mid, kind, body):
+        payload = event(mid, kind, body)
+        payload["event"]["message"]["chat_type"] = "p2p"
+        await adapter.handle(payload)
+
+    old_thread = thread_id_for("tenant", "oc_chat", "dm")
+    new_thread = thread_id_for("tenant", "oc_chat", "dm_om_reset")
+    document = {"file_key": "file_extra", "file_name": "补充.pdf"}
+    await send("om_initial", "file", document)
+    client.send.assert_not_called()
+    runtime.attach.reset_mock()
+
+    report = asyncio.create_task(send("om_report", "text", {"text": "write a report"}))
+    upload = None
+    try:
+        await asyncio.wait_for(started.wait(), timeout=2)
+        upload = asyncio.create_task(send("om_upload", "file", document))
+        await asyncio.wait_for(reminder.wait(), timeout=2)
+        client.send.assert_called_once()
+        chat, root, kind, body = client.send.call_args.args
+        assert (chat, root, kind) == ("oc_chat", "dm", "post")
+        assert "`/new`" in body["zh_cn"]["content"][0][0]["text"]
+        assert not upload.done()
+        runtime.attach.assert_not_awaited()
+        runtime.ask.assert_awaited_once_with("write a report", thread_id=old_thread)
+        await asyncio.wait_for(send("om_upload", "file", document), timeout=2)
+        await asyncio.wait_for(send("om_reset", "text", {"text": "/new"}), timeout=2)
+        await asyncio.wait_for(send("om_next", "text", {"text": "a different report"}), timeout=2)
+        runtime.ask.assert_awaited_with("a different report", thread_id=new_thread)
+        assert runtime.ask.await_count == 2
+        assert sum(
+            "新附件会在本轮结束后" in call.args[3]["zh_cn"]["content"][0][0]["text"]
+            for call in client.send.call_args_list
+        ) == 1
+    finally:
+        finish.set()
+        await asyncio.gather(*(task for task in (report, upload) if task is not None))
+    runtime.attach.assert_awaited_once_with(
+        old_thread, [("补充.pdf", b"extra material")], on_preprocess=None
+    )
+
+
 @pytest.mark.skipif(os.getenv("INSIGHTFUL_DOCKER_TESTS") != "1", reason="requires report sandbox")
 async def test_feishu_sends_report_progress_during_writing(tmp_path):
     client = MagicMock(spec=FeishuClient)

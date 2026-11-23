@@ -259,6 +259,7 @@ class FeishuAdapter:
     _locks: dict[str, asyncio.Lock] = field(default_factory=dict)
     _progress: dict[str, FeishuProgress] = field(default_factory=dict)
     _progress_delivery_locks: dict[str, asyncio.Lock] = field(default_factory=dict)
+    _running_turns: set[str] = field(default_factory=set)
 
     def accepts(self, payload: Mapping[str, Any]) -> bool:
         return self.rejection_reason(payload) is None
@@ -303,27 +304,23 @@ class FeishuAdapter:
         _LOGGER.warning("[feishu] message event accepted")
         self._task(self.handle(payload))
 
-    async def _direct_thread(self, chat: str, mid: str, message: Mapping[str, Any]) -> str | None:
+    async def _direct_thread(self, chat: str, mid: str, *, reset: bool) -> str | None:
         key = thread_id_for(self.tenant, chat, "dm")
-        # Only routing is locked here; /new must not wait for the old agent turn.
+        # Route independently of the old agent turn, including for /new.
         async with self._locks.setdefault("route:" + key, asyncio.Lock()):
             saved = await self.store.aget(_DM_NAMESPACE, key)
             state = dict(saved.value) if saved is not None else {}
             recent = list(state.get("messages") or [])
             if mid in recent:
                 return None
-            is_new = (
-                message.get("message_type") == "text"
-                and message_content(message, self.bot)[0] == "/new"
-            )
-            root = "dm_" + mid if is_new else str(state.get("root") or "dm")
+            root = "dm_" + mid if reset else str(state.get("root") or "dm")
             await self.store.aput(
                 _DM_NAMESPACE,
                 key,
                 {"root": root, "messages": (recent + [mid])[-RECENT_MESSAGES:]},
             )
             thread = thread_id_for(self.tenant, chat, root)
-            if is_new:
+            if reset:
                 await self.post(
                     thread,
                     "已开始新会话。请发送新的任务和所需文件。旧会话保留，工作文件按服务保留期清理；正在执行的旧任务会继续完成。",
@@ -340,13 +337,29 @@ class FeishuAdapter:
         chat, mid = identifier(message["chat_id"]), identifier(message["message_id"])
         direct = message["chat_type"] == "p2p"
         root = "dm" if direct else identifier(message.get("root_id") or mid)
+        content_error = None
+        try:
+            text, resources = message_content(message, self.bot)
+        except FeishuError as error:
+            content_error = error
+            text, resources = "", []
         thread = (
-            await self._direct_thread(chat, mid, message)
+            await self._direct_thread(
+                chat,
+                mid,
+                reset=message.get("message_type") == "text" and text == "/new",
+            )
             if direct
             else thread_id_for(self.tenant, chat, root)
         )
         if thread is None:
             return
+        if direct and resources and thread in self._running_turns:
+            self.post_soon(
+                thread,
+                "当前任务正在处理。新附件会在本轮结束后加入当前会话，可用于后续修订。"
+                "如要写一份独立报告，请先发送 `/new`，再重新发送附件和报告要求。",
+            )
         async with self._locks.setdefault(thread, asyncio.Lock()):
             saved = await self.store.aget(_NAMESPACE, thread)
             state = dict(saved.value) if saved is not None else {}
@@ -373,7 +386,8 @@ class FeishuAdapter:
                     # A receipt reaction is presentation only; it must never block the work.
                     _LOGGER.warning("[feishu] receipt reaction unavailable: %s", error)
                 with self.runtime.trace.request(thread, "feishu", sender_id):
-                    text, resources = message_content(message, self.bot)
+                    if content_error is not None:
+                        raise content_error
                     if any(kind == "folder" for _, _, kind in resources):
                         settings = self.runtime.settings
                         if settings.source_input_mode != "legacy" and not (
@@ -421,7 +435,11 @@ class FeishuAdapter:
                         )
                         if not text:
                             return
-                    added = await self.runtime.ask(text or "(attachment)", thread_id=thread)
+                    self._running_turns.add(thread)
+                    try:
+                        added = await self.runtime.ask(text or "(attachment)", thread_id=thread)
+                    finally:
+                        self._running_turns.discard(thread)
                     await self.post(thread, final_text(added))
                     if progress is not None:
                         await progress.close()

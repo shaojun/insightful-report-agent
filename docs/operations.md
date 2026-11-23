@@ -30,7 +30,7 @@ LANGFUSE_SECRET_KEY=
 
 填入 `FEISHU_APP_ID`、`FEISHU_APP_SECRET` 和 `FEISHU_TENANT_KEY`。在飞书开放平台启用机器人，选长连接接收事件并订阅 `im.message.receive_v1`，发布包含所需权限的应用版本。参考 [权限配置样例](../config/feishu-permissions.example.json)。
 
-安装 `uv sync --extra feishu` 后用统一入口启动。单独调试时可运行 `uv run insightful-report-agent feishu`。同一个飞书应用只启动一个消费者。群内首次 @机器人建立话题，后续材料和报告目标留在同一话题。飞书入口每条最多处理 10 个附件，并受平台文件大小限制。上传预处理服务生成的结果 ZIP。私聊默认持续收集，发 `/new` 开始新会话。
+安装 `uv sync --extra feishu` 后用统一入口启动。单独调试时可运行 `uv run insightful-report-agent feishu`。同一个飞书应用只启动一个消费者。群内首次 @机器人建立话题，后续材料和报告目标留在同一话题。飞书入口每条最多处理 100 个附件，并受平台文件大小限制。上传预处理服务生成的结果 ZIP。私聊中发 `/new` 可开启独立会话。当前任务运行期间上传的附件会排队，任务结束后加入原会话；机器人会立即提示用户如何开启独立任务。
 
 启用原始附件直连预处理或旧版原始文件收件后，可以把本地文件夹直接发到飞书。机器人使用 `im:message:readonly` 展开聊天附件目录，逐个下载文件并保留相对路径。每个目录支持最多 100 个文件和子目录，嵌套最多 16 层，生成的 ZIP 最大 100 MiB。可以在同一条消息里附上报告要求，也可以先发送文件夹再发要求。
 
