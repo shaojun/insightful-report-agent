@@ -9,7 +9,7 @@ import os
 from email import policy
 from email.parser import BytesParser
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, call
 from uuid import uuid4
 from zipfile import ZipFile
 
@@ -35,7 +35,7 @@ from insightful_report_agent.surfaces.feishu.client import (
     FeishuError,
     FolderAttachmentError,
 )
-from insightful_report_agent.tools.delivery import LocalOutputAdapter
+from insightful_report_agent.tools.delivery import LocalOutputAdapter, pending_reports
 from insightful_report_agent.tools.mineru import MinerU
 from tests.scripted_model import RespondingChatModel, ScriptedChatModel, reply, tool_call
 from tests.test_report_graph import tool_data
@@ -195,6 +195,29 @@ async def test_feishu_dm_reminds_user_while_attachment_waits_for_active_turn():
     )
 
 
+async def test_feishu_delivers_ready_report_when_finalization_fails():
+    client = MagicMock(spec=FeishuClient)
+    runtime = MagicMock()
+    adapter = FeishuAdapter(client, "cli_test", "tenant", "ou_bot", False, runtime, InMemoryStore())
+    filename = "insightful-report-test.html"
+
+    async def send_report():
+        client.send_file("oc_chat", "om_first", filename, b"<html>Report</html>", uuid="report")
+
+    async def ask(*_args, **_kwargs):
+        pending_reports.get()[filename] = send_report
+        raise RuntimeError("test finalization failure")
+
+    runtime.ask = AsyncMock(side_effect=ask)
+    await adapter.handle(event("om_first", "text", {"text": "write a report"}, first=True))
+
+    client.send.assert_called_once()
+    assert "本轮收尾未完成" in str(client.send.call_args.args[3])
+    assert client.method_calls[-1] == call.send_file(
+        "oc_chat", "om_first", filename, b"<html>Report</html>", uuid="report"
+    )
+
+
 @pytest.mark.skipif(os.getenv("INSIGHTFUL_DOCKER_TESTS") != "1", reason="requires report sandbox")
 async def test_feishu_sends_report_progress_during_writing(tmp_path):
     client = MagicMock(spec=FeishuClient)
@@ -212,6 +235,9 @@ async def test_feishu_sends_report_progress_during_writing(tmp_path):
             "report-progress.md",
             initial.encode(),
         )
+        return tool_call("read_file", {"file_path": path})
+
+    def draft_chapter(_):
         return tool_call(
             "write_file",
             {"file_path": "/workspace/projects/demo/chapter-1.md", "content": "# Chapter"},
@@ -247,6 +273,7 @@ async def test_feishu_sends_report_progress_during_writing(tmp_path):
         steps=[
             lambda _: tool_call("write_file", {"file_path": path, "content": initial}),
             next_chapter,
+            draft_chapter,
             checkpoint,
             retry_unchanged,
             fail_edit,
@@ -267,7 +294,7 @@ async def test_feishu_sends_report_progress_during_writing(tmp_path):
     try:
         await adapter.handle(payload)
         assert client.send_file.call_count == 2
-        assert lead.call_count == 6
+        assert lead.call_count == 7
         previews = [
             item.args[3]["zh_cn"]["content"][0][0]["text"]
             for item in client.send.call_args_list
@@ -276,6 +303,10 @@ async def test_feishu_sends_report_progress_during_writing(tmp_path):
         assert len(previews) == 2
         assert "第 1 次更新" in previews[0] and "第一章待起草" in previews[0]
         assert "第 2 次更新" in previews[1] and "第一章已完成" in previews[1]
+        final_card = json.dumps(client.edit_card.call_args.args[1], ensure_ascii=False)
+        assert "已保存报告写作进度（report-progress.md）" in final_card
+        assert "已回顾报告写作进度（report-progress.md）" in final_card
+        assert "已更新报告写作进度（report-progress.md）" in final_card
     finally:
         await runtime.aclose()
         runtime.binding.runner.stop_all()
@@ -670,13 +701,17 @@ async def test_feishu_multiple_messages_and_files_to_rich_report(tmp_path: Path)
             "read_source_file_abstract", {"file_path": middle["source_id"], "level": "low"}
         )
 
-    def draft(messages):
+    def read_evidence(messages):
         assert tool_data(messages, "read_source_file_abstract")["path"].endswith(".abstract.low")
         assert abstract.call_count == 5
+        source = tool_data(messages, "read_source_file_abstract")["source_id"]
+        return tool_call("read_source_evidence", {"file_path": source, "block_id": "b0001"})
+
+    def draft(messages):
         sources = tool_data(messages, "list_sources")["sources"]
         image = next(item["id"] for item in sources if item["name"].endswith(".png"))
-        text = next(item["id"] for item in sources if item["name"].endswith("业绩资料.txt"))
-        ref = f"[[{text}#b0001]]"
+        evidence = tool_data(messages, "read_source_evidence")
+        ref = f"[[{evidence['source_id']}#{evidence['blocks'][0]['id']}]]"
         chart = json.dumps(
             {
                 "title": "订单对比",
@@ -703,7 +738,15 @@ async def test_feishu_multiple_messages_and_files_to_rich_report(tmp_path: Path)
         result = tool_data(messages, "publish_report")
         assert result["reviewed"] == 2 and result["visuals"] == 2
         assert result["source_figures"] == 1
-        return reply("季度报告已交付。")
+        assert result["queued_for_delivery"].endswith(".html") and "delivered" not in result
+        assert not any(name.endswith(".html") for name in uploaded)
+        return tool_call(
+            "write_file",
+            {
+                "file_path": "/workspace/projects/demo/report-progress.md",
+                "content": "# 写作进度\n\n已完成最终排版与引用检查。\n",
+            },
+        )
 
     def publish_after_validation(messages):
         result = tool_data(messages, "publish_report")
@@ -726,6 +769,7 @@ async def test_feishu_multiple_messages_and_files_to_rich_report(tmp_path: Path)
             read_middle,
             read_cached_middle,
             read_low,
+            read_evidence,
             draft,
             lambda _: tool_call(
                 "publish_report",
@@ -737,6 +781,7 @@ async def test_feishu_multiple_messages_and_files_to_rich_report(tmp_path: Path)
             ),
             publish_after_validation,
             published,
+            lambda _: reply("季度报告已就绪，附件随后发送。"),
         ]
     )
     abstract = RespondingChatModel(respond=lambda _: AIMessage(content="测试材料摘要。"))
@@ -825,7 +870,8 @@ async def test_feishu_multiple_messages_and_files_to_rich_report(tmp_path: Path)
                 },
             )
         )
-        assert len(uploaded) == 3
+        assert len(uploaded) == 4
+        assert "report-progress.md" in uploaded
         filename, report = next(
             (name, data) for name, data in uploaded.items() if name.endswith(".html")
         )
@@ -838,7 +884,7 @@ async def test_feishu_multiple_messages_and_files_to_rich_report(tmp_path: Path)
         assert "业绩资料.txt" in html.get_text()
         assert all(html.find(id=node["href"][1:]) for node in html.select("a.cite"))
         delivery = [(path, data) for path, data in sent if data["msg_type"] == "file"]
-        assert len(delivery) == 3
+        assert len(delivery) == 4
         assert all(
             path.endswith("/om_first/reply") and data["reply_in_thread"] for path, data in delivery
         )
@@ -846,12 +892,17 @@ async def test_feishu_multiple_messages_and_files_to_rich_report(tmp_path: Path)
             {"file_key": "file_1"},
             {"file_key": "file_2"},
             {"file_key": "file_3"},
+            {"file_key": "file_4"},
         ]
-        assert any(
-            "季度报告已交付" in json.loads(data["content"])["zh_cn"]["content"][0][0]["text"]
-            for _, data in sent
-            if data["msg_type"] == "post"
+        assert sent[-1] == delivery[-1]
+        assert list(uploaded)[-1] == filename
+        assert "季度报告已就绪" in (
+            json.loads(sent[-2][1]["content"])["zh_cn"]["content"][0][0]["text"]
         )
+        receipt = await asyncio.to_thread(
+            runner.exec, thread, f"cat /workspace/source-library/deliveries/{filename}.json"
+        )
+        assert json.loads(receipt.output) == {"file": filename}
         assert any(
             "已收到你的文字请求，接下来会继续处理"
             in json.loads(data["content"])["zh_cn"]["content"][0][0]["text"]
@@ -861,11 +912,13 @@ async def test_feishu_multiple_messages_and_files_to_rich_report(tmp_path: Path)
         assert cards and "处理完成" in cards[-1]["header"]["title"]["content"]
         last_card = json.dumps(cards[-1], ensure_ascii=False)
         for step in (
-            "已核对 2 份材料的资料总览",
+            "已获取资料覆盖总览（可用 2/2 份）",
             "已读取高层摘要",
             "已生成中层摘要",
             "已读取中层摘要",
             "已生成低层摘要",
+            "已从导出正文读取 1 段证据",
+            "正式报告已就绪，将在本轮结束时发送",
         ):
             assert step in last_card
     finally:

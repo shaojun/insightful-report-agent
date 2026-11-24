@@ -22,6 +22,7 @@ import re
 import shlex
 import time
 from collections.abc import Awaitable, Callable, Sequence
+from contextvars import ContextVar
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Annotated, Any, Protocol, cast
@@ -42,6 +43,11 @@ WORKSPACE = "/workspace"
 UPLOADED = "Files uploaded."
 NOT_CONFIRMED = "File delivery was not confirmed. Do not retry this upload automatically."
 SAFE_NAME = re.compile(r"[^A-Za-z0-9._ -]+")
+
+# A chat surface can defer formal reports until it has posted the rest of the turn.
+pending_reports: ContextVar[dict[str, Callable[[], Awaitable[None]]] | None] = ContextVar(
+    "pending_reports", default=None
+)
 
 
 @dataclass(frozen=True)

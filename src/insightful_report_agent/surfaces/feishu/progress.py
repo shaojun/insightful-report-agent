@@ -23,13 +23,13 @@ MAX_CARD_BYTES = 27_000  # Leave room for the API envelope and later status chan
 
 SOURCE_STEPS = {
     "list_sources": ("正在查看材料清单", "已查看材料清单"),
-    "prepare_source_overview": ("正在核对材料预处理结果", "已核对材料预处理结果"),
-    "synthesize_source_overview": ("正在综合本轮材料的高层摘要", "已生成材料综合总览"),
+    "prepare_source_overview": ("正在读取一批资料的处理状态", "已读取一批资料的处理状态"),
+    "synthesize_source_overview": ("正在获取本轮资料覆盖总览", "已获取本轮资料覆盖总览"),
     "list_source_figures": ("正在查找资料中的图", "已查看资料图清单"),
-    "read_source_evidence": ("正在核对来源证据", "已读取原文证据"),
+    "read_source_evidence": ("正在从导出正文检索证据片段", "已检索导出正文中的证据片段"),
     "search_web": ("正在搜索公开资料", "已搜索公开资料"),
     "add_source_urls": ("正在收录补充网页", "已收录补充网页"),
-    "publish_report": ("正在校验和发送报告", "已发送正式报告"),
+    "publish_report": ("正在校验并准备发送报告", "已确认正式报告"),
     "ls": ("正在查看工作区目录", "已查看工作区目录"),
 }
 ABSTRACT_LEVELS = {"high": "高层", "middle": "中层", "low": "低层"}
@@ -56,8 +56,21 @@ def step_phrase(name: str, args: Mapping[str, Any]) -> tuple[str, str]:
         kind = "来源附图" if source_images else "图片"
         count = f"（本批 {len(selected)} 张）" if selected else ""
         return f"正在用视觉模型检查{kind}{count}", f"已完成{kind}检查{count}"
+    if name in {"read_file", "write_file", "edit_file"}:
+        path = posixpath.normpath(posixpath.join("/workspace", str(args.get("file_path") or "")))
+        if path.startswith("/workspace/projects/") and path.endswith("/report-progress.md"):
+            return {
+                "read_file": ("正在回顾报告写作进度", "已回顾报告写作进度（report-progress.md）"),
+                "write_file": ("正在保存报告写作进度", "已保存报告写作进度（report-progress.md）"),
+                "edit_file": ("正在更新报告写作进度", "已更新报告写作进度（report-progress.md）"),
+            }[name]
+        if path.startswith("/workspace/projects/") and path.lower().endswith(".md"):
+            return {
+                "read_file": ("正在阅读报告工作区的 Markdown", "已阅读报告工作区的 Markdown"),
+                "write_file": ("正在保存报告工作区的 Markdown", "已保存报告工作区的 Markdown"),
+                "edit_file": ("正在修改报告工作区的 Markdown", "已修改报告工作区的 Markdown"),
+            }[name]
     if name == "read_file":
-        path = posixpath.normpath(str(args.get("file_path") or ""))
         if path in {
             "/skills/evidence-report/SKILL.md",
             "/workspace/skills/evidence-report/SKILL.md",
@@ -67,11 +80,13 @@ def step_phrase(name: str, args: Mapping[str, Any]) -> tuple[str, str]:
             path.startswith("/workspace/source-library/")
             and posixpath.basename(path) == "source.md"
         ):
-            return "正在阅读归一化原文", "已阅读归一化原文"
+            return "正在阅读导出正文（Markdown）", "已阅读导出正文（Markdown）"
         if path.startswith("/workspace/source-library/overviews/") and path.endswith("/catalog.md"):
             return "正在阅读来源覆盖清单", "已阅读来源覆盖清单"
         if path == "/workspace/tools/source_report.py":
             return "正在阅读报告渲染脚本", "已阅读报告渲染脚本"
+        if path.lower().endswith((".md", ".txt")):
+            return "正在读取文本文件", "已读取文本文件"
     if name == "execute":
         command = str(args.get("command") or "")
         if "/workspace/source-library/" in command and re.match(r"\s*(?:ls|wc)\s", command):
@@ -82,11 +97,6 @@ def step_phrase(name: str, args: Mapping[str, Any]) -> tuple[str, str]:
             return "正在查看工作区目录", "已查看工作区目录"
     if name == "publish_report" and args.get("validate_only") is True:
         return "正在校验报告排版与引用", "已校验报告排版与引用"
-    if (
-        name in {"write_file", "edit_file"}
-        and posixpath.basename(str(args.get("file_path") or "")) == "report-progress.md"
-    ):
-        return "正在更新报告写作进度", "已更新报告写作进度"
     return SOURCE_STEPS.get(name) or phrase(name, args)
 
 
@@ -179,7 +189,12 @@ class FeishuProgress:
         step.ended, step.failed = time.monotonic(), failed
         if failed:
             step.reason = failure_reason(error)
-        elif name in {"read_source_file_abstract", "synthesize_source_overview"}:
+        elif name in {
+            "publish_report",
+            "read_source_evidence",
+            "read_source_file_abstract",
+            "synthesize_source_overview",
+        }:
             try:
                 result = json.loads(content) if isinstance(content, str) else content
             except ValueError:
@@ -190,10 +205,26 @@ class FeishuProgress:
                     if level and isinstance(result.get("generated"), bool):
                         verb = "生成" if result["generated"] else "读取"
                         step.done = f"已{verb}{level}摘要"
+                elif name == "read_source_evidence":
+                    blocks = result.get("blocks")
+                    if isinstance(blocks, list):
+                        step.done = (
+                            f"已从导出正文读取 {len(blocks)} 段证据"
+                            if blocks
+                            else "本次检索未返回证据片段"
+                        )
+                        if blocks and type(result.get("next_cursor")) is int:
+                            step.done += "（还有后续片段）"
+                elif name == "publish_report":
+                    if "queued_for_delivery" in result:
+                        step.done = "正式报告已就绪，将在本轮结束时发送"
+                    elif "delivered" in result:
+                        step.done = "已确认正式报告已发送"
                 else:
                     reviewed = result.get("reviewed")
-                    if type(reviewed) is int and 0 < reviewed <= 1_000_000:
-                        step.done = f"已核对 {reviewed} 份材料的资料总览"
+                    total = result.get("source_count")
+                    if type(reviewed) is int and type(total) is int and 0 <= reviewed <= total:
+                        step.done = f"已获取资料覆盖总览（可用 {reviewed}/{total} 份）"
         self._schedule()
 
     def _schedule(self) -> None:

@@ -33,6 +33,7 @@ from insightful_report_agent.tools.abstract_prompts import (
     Level,
     load_abstract_prompts,
 )
+from insightful_report_agent.tools.delivery import DeliveredFile, pending_reports
 from insightful_report_agent.tools.fetch import FetchRefused
 from insightful_report_agent.tools.files import (
     WorkspaceError,
@@ -1101,22 +1102,30 @@ class SourceLibrary:
             )
 
     async def deliver(self, backend, adapter, runtime, receipt, name, data, output, corpus) -> dict:
-        from insightful_report_agent.tools.delivery import DeliveredFile
-
+        status = "delivered"
         if await self.optional(backend, receipt) is None:
-            try:
-                await asyncio.to_thread(
-                    adapter.deliver,
-                    self.profile.thread_id_for(runtime),
-                    [DeliveredFile(name=name, content=data)],
-                )
-            except Exception as error:  # noqa: BLE001
-                raise ToolException(
-                    f"Report rendered but delivery could not be confirmed ({type(error).__name__})"
-                ) from None
-            await self.put(backend, receipt, {"file": name})
+            thread = self.profile.thread_id_for(runtime)
+
+            async def send() -> None:
+                try:
+                    await asyncio.to_thread(
+                        adapter.deliver, thread, [DeliveredFile(name=name, content=data)]
+                    )
+                except Exception as error:  # noqa: BLE001
+                    raise ToolException(
+                        "Report rendered but delivery could not be confirmed "
+                        f"({type(error).__name__})"
+                    ) from None
+                await self.put(backend, receipt, {"file": name})
+
+            queue = pending_reports.get()
+            if queue is None:
+                await send()
+            else:
+                queue[name] = send
+                status = "queued_for_delivery"
         return {
-            "delivered": name,
+            status: name,
             "reviewed": corpus["reviewed"],
             "failed": corpus["failed"],
             "citations": output["citations"],

@@ -21,6 +21,7 @@ from langchain.agents.middleware import AgentMiddleware
 from langchain.agents.middleware.types import AgentState, ToolCallRequest
 from langchain_core.messages import ToolMessage
 from langchain_core.runnables.config import var_child_runnable_config
+from langchain_core.tools import ToolException
 from langgraph.types import Command
 
 from insightful_report_agent.config import Settings
@@ -39,7 +40,11 @@ from insightful_report_agent.surfaces.feishu.client import (
     identifier,
 )
 from insightful_report_agent.surfaces.feishu.progress import FeishuProgress, duration
-from insightful_report_agent.tools.delivery import DeliveredFile, LocalOutputAdapter
+from insightful_report_agent.tools.delivery import (
+    DeliveredFile,
+    LocalOutputAdapter,
+    pending_reports,
+)
 from insightful_report_agent.tools.files import WorkspaceError, read_bytes, workspace_path
 
 _LOGGER = logging.getLogger(__name__)
@@ -435,14 +440,39 @@ class FeishuAdapter:
                         )
                         if not text:
                             return
+                    reports: dict[str, Callable[[], Awaitable[None]]] = {}
+                    queue_token = pending_reports.set(reports)
                     self._running_turns.add(thread)
+                    finalization_failed = False
                     try:
                         added = await self.runtime.ask(text or "(attachment)", thread_id=thread)
+                        summary = final_text(added)
+                    except Exception as error:
+                        if not reports:
+                            raise
+                        _LOGGER.warning("[feishu] report finalization failed: %s", type(error).__name__)
+                        finalization_failed = True
+                        summary = "本轮收尾未完成，已生成的 HTML 报告将在下方发送。"
                     finally:
                         self._running_turns.discard(thread)
-                    await self.post(thread, final_text(added))
+                        pending_reports.reset(queue_token)
+                    try:
+                        await self.post(thread, summary)
+                    except FeishuError:
+                        if not reports:
+                            raise
+                        _LOGGER.warning("[feishu] report summary could not be sent")
                     if progress is not None:
-                        await progress.close()
+                        await progress.close(failed=finalization_failed)
+                    if reports:
+                        config_token = var_child_runnable_config.set(
+                            {"configurable": {"thread_id": thread}}
+                        )
+                        try:
+                            for send in reports.values():
+                                await send()
+                        finally:
+                            var_child_runnable_config.reset(config_token)
             except asyncio.CancelledError:
                 if progress is not None:
                     await progress.close(failed=True)
@@ -454,6 +484,8 @@ class FeishuAdapter:
                     await progress.close(failed=True)
                 if isinstance(error, PreprocessorError):
                     await self.post(thread, "外部预处理未返回可用的资料包。请重新发送附件以重试。")
+                elif isinstance(error, ToolException):
+                    await self.post(thread, "报告已生成，但未能确认 HTML 附件送达。")
                 elif reason == "too_many_attachments":
                     await self.post(
                         thread,
