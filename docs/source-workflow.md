@@ -6,9 +6,15 @@
 
 工作流通过 `prepare_source_overview` 读取分页覆盖结果，`synthesize_source_overview` 建立当前快照的可发布覆盖目录。随后按章节查阅现有简报与原文，用 `publish_report(validate_only=true)` 渲染检查，再交付 HTML。
 
+## 补充公开网页研究
+
+设置 `DEEPSEEK_API_KEY` 后，Agent 可通过 `search_web` 调用 DeepSeek Search API，查找与章节相关的公开资料。可设置 `INSIGHTFUL_REPORT_AGENT_ENABLE_WEB_SEARCH=false` 关闭搜索。搜索请求由 Agent 的宿主进程访问 `https://api.deepseek.com/v1/tools/search`，密钥留在宿主，Docker 沙箱保持断网。查询只发送公开关键词，DeepSeek 按成功且有结果的请求计费。 [DeepSeek Search](https://api-docs.deepseek.com/zh-cn/guides/search/)
+
+搜索返回标题、链接和可用的摘要。配置了外部预处理服务时，`add_source_urls` 会把选定的公开网页交给该服务抓取、解析与摘要，再将结果 ZIP 导入本会话。报告通过当前快照中的网页正文块引用证据。仅配置搜索时，仍可发现网页，正式引用需要先导入对应的预处理结果。
+
 ## 旧版原始文件收件
 
-旧线程需要原始文件解析时，可在独立实例中设置 `INSIGHTFUL_REPORT_AGENT_SOURCE_INPUT_MODE=legacy`。以下解析、搜索、转写与摘要设置仅用于旧版模式。
+旧线程需要原始文件解析时，可在独立实例中设置 `INSIGHTFUL_REPORT_AGENT_SOURCE_INPUT_MODE=legacy`。以下解析、转写与摘要设置仅用于旧版模式。
 
 ## 归一化与定位
 

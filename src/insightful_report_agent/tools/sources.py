@@ -19,10 +19,11 @@ from langchain.tools import ToolRuntime
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_core.tools import BaseTool, StructuredTool, ToolException
-from pydantic import Field
+from pydantic import Field, HttpUrl, ValidationError
 
 from insightful_report_agent.config import Settings
 from insightful_report_agent.models.factory import build_chat_model, named_key, resolve_model
+from insightful_report_agent.runtime.preprocessor import PreprocessorError, preprocess
 from insightful_report_agent.runtime.profiles import RuntimeProfile
 from insightful_report_agent.tools.abstract_prompts import (
     BOUNDARY,
@@ -61,6 +62,7 @@ VISUAL_ID = re.compile(r"a\d{4,}")
 CITATION = re.compile(r"\[\[(s-[0-9a-f]{16})#(b\d{4,})\]\]")
 ABSTRACT_REFERENCE = re.compile(rf"{CITATION.pattern}|{SOURCE_ID.pattern}#{BLOCK_ID.pattern}")
 URL_SUFFIX = ".insightful-url"
+DEEPSEEK_SEARCH_URL = "https://api.deepseek.com/v1/tools/search"
 
 
 def url_files(urls: Sequence[str]) -> list[tuple[str, bytes]]:
@@ -156,8 +158,14 @@ class SourceLibrary:
         self.legacy = settings.source_input_mode == "legacy"
         self.search_key = (
             named_key("DEEPSEEK_API_KEY", profile.project_root)
-            if self.legacy and settings.model == "openai:deepseek-flash"
+            if settings.enable_web_search
             else None
+        )
+        self.exa_search = (
+            settings.exa_api_key if self.legacy and settings.enable_web_search else None
+        )
+        self.preprocess_urls = bool(
+            not self.legacy and settings.preprocessor_api_url and settings.preprocessor_api_key
         )
         self.mineru = (
             MinerU(settings.mineru_api_token.get_secret_value(), wait=settings.mineru_wait_seconds)
@@ -812,33 +820,56 @@ class SourceLibrary:
             }
 
         async def add_source_urls(
-            urls: Annotated[list[str], Field(min_length=1, max_length=30)],
+            urls: Annotated[list[HttpUrl], Field(min_length=1, max_length=30)],
             runtime: ToolRuntime,
         ) -> dict:
-            """Register and prepare supplementary public URLs as evidence. Refresh the corpus overview after adding them."""
+            """Import selected public webpages as evidence. This may take several minutes. Refresh the corpus overview and read exact evidence blocks before citing."""
+            if any(url.username is not None or url.password is not None for url in urls):
+                raise ToolException("URLs with embedded credentials are refused")
+            links = list(dict.fromkeys(map(str, urls)))
             backend = self.backend(runtime)
-            files = url_files(urls)
-            if any(
-                len(data) > 4096 or not data.startswith((b"http://", b"https://"))
-                for _, data in files
-            ):
-                raise ToolException("Each URL must be a public HTTP(S) URL of at most 4096 bytes")
+            if self.preprocess_urls:
+                async with self._locks.setdefault(f"{self.thread_id()}:web-intake", asyncio.Lock()):
+                    records = await self.records(backend)
+                    existing = {record.get("url") for record in records if not record.get("error")}
+                    pending = [link for link in links if link not in existing]
+                    state = None
+                    if pending:
+                        try:
+                            name, data, state = await preprocess(
+                                self.settings, None, {}, urls=pending
+                            )
+                        except PreprocessorError as error:
+                            raise ToolException(str(error)) from None
+                        digest = hashlib.sha256(data).hexdigest()
+                        await self.save(backend, f"/workspace/attachments/{digest}/{name}", data)
+                        records = await self.records(backend)
+                    await self.prepare_sources(backend, records)
+                    return {
+                        "submitted": len(pending),
+                        "already_available": len(links) - len(pending),
+                        "preprocessing_state": state,
+                        "snapshot": self.snapshot(records),
+                    }
+            files = url_files(links)
             for name, content in files:
                 await write_bytes(backend, f"/workspace/attachments/web/{name}", content)
             await self.prepare_sources(backend, await self.records(backend))
-            return {"registered": len(urls)}
+            return {"registered": len(links)}
 
         async def search_web(
             query: Annotated[str, Field(min_length=1, max_length=128)],
-            runtime: ToolRuntime,  # noqa: ARG001
         ) -> list[dict]:
-            """Find public evidence candidates. Use generic queries with no confidential material. Register selected URLs before citing their contents."""
-            key = self.settings.exa_api_key
-            if key:
-                url, headers = "https://api.exa.ai/search", {"x-api-key": key.get_secret_value()}
+            """Search the public web for supplementary sources. Send only public search terms. Results are discovery leads, including provider summaries; verify selected pages before citing."""
+            query = query.strip()
+            if not query:
+                raise ToolException("Enter a non-blank web search query")
+            if self.exa_search:
+                url = "https://api.exa.ai/search"
+                headers = {"x-api-key": self.exa_search.get_secret_value()}
                 body = {"query": query, "numResults": 8}
             elif self.search_key:
-                url = "https://api.deepseek.com/v1/tools/search"
+                url = DEEPSEEK_SEARCH_URL
                 headers = {"Authorization": f"Bearer {self.search_key}"}
                 body = {"query": query, "count": 8, "need_content": False}
             else:
@@ -847,12 +878,40 @@ class SourceLibrary:
                 async with httpx.AsyncClient(timeout=30) as client:
                     response = await client.post(url, headers=headers, json=body)
                     response.raise_for_status()
-                    return [
-                        {field: row.get(field) for field in ("url", "title", "publishedDate")}
-                        for row in response.json().get("results", [])[:8]
-                    ]
-            except (httpx.HTTPError, ValueError):
-                raise ToolException("Web search failed") from None
+                    rows = response.json()["results"]
+                    if not isinstance(rows, list):
+                        raise ValueError("Expected a results array")
+            except httpx.HTTPStatusError as error:
+                raise ToolException(
+                    f"Web search provider HTTP {error.response.status_code}"
+                ) from None
+            except (httpx.HTTPError, KeyError, TypeError, ValueError):
+                raise ToolException(
+                    "Web search provider unavailable or returned an invalid response"
+                ) from None
+            results = []
+            for row in rows[:8]:
+                if not isinstance(row, dict):
+                    continue
+                try:
+                    link = HttpUrl(row.get("url"))
+                except ValidationError:
+                    continue
+                if link.username is not None or link.password is not None:
+                    continue
+                result = {"url": str(link)}
+                for field, limit in (
+                    ("title", 300),
+                    ("date", 80),
+                    ("publishedDate", 80),
+                    ("site_name", 200),
+                    ("snippet", 300),
+                    ("summary", 1000),
+                ):
+                    if isinstance(value := row.get(field), str):
+                        result[field] = value[:limit]
+                results.append(result)
+            return results
 
         async def publish_report(
             draft_path: str,
@@ -880,10 +939,10 @@ class SourceLibrary:
             read_source_evidence,
             publish_report,
         ]
-        if self.legacy:
+        if self.legacy or self.preprocess_urls:
             functions.append(add_source_urls)
-            if self.settings.exa_api_key or self.search_key:
-                functions.append(search_web)
+        if self.exa_search or self.search_key:
+            functions.append(search_web)
         return [
             StructuredTool.from_function(coroutine=fn, handle_tool_error=True) for fn in functions
         ]

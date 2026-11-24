@@ -11,6 +11,7 @@ from pathlib import Path
 from uuid import uuid4
 from zipfile import ZipFile
 
+import httpx
 import pytest
 from fastapi.testclient import TestClient
 from langchain_core.messages import AIMessage, ToolMessage
@@ -164,6 +165,7 @@ async def test_preprocessed_archive_to_html_without_provider_calls(tmp_path: Pat
         preprocessor_api_key="unused-test-key",
         mineru_api_token="legacy-token",
         exa_api_key="legacy-search-key",
+        enable_web_search=False,
         abstract_model="unused:legacy-provider",
     )
     runtime = build_local_runtime(
@@ -172,9 +174,9 @@ async def test_preprocessed_archive_to_html_without_provider_calls(tmp_path: Pat
     thread = "cli-preprocessed-" + uuid4().hex[:8]
     try:
         assert runtime.components.source_library.mineru is None
-        assert not {"search_web", "add_source_urls"} & {
-            tool.name for tool in runtime.components.tools
-        }
+        names = {tool.name for tool in runtime.components.tools}
+        assert "search_web" not in names
+        assert "add_source_urls" in names
         await runtime.attach(thread, [("result.zip", archive.getvalue())])
         messages = await runtime.ask("Write a sourced report on sales.", thread_id=thread)
         html = (runtime.out_dir / thread / final_text(messages)).read_text()
@@ -182,6 +184,139 @@ async def test_preprocessed_archive_to_html_without_provider_calls(tmp_path: Pat
         assert "Export SHA-256" in html and "ZIP SHA-256" in html
         assert "Original workspace path" not in html
         assert "data:image/jpeg;base64," in html
+    finally:
+        await runtime.aclose()
+        runtime.binding.runner.stop_all()
+
+
+async def test_deepseek_search_and_cite_a_preprocessed_webpage(tmp_path, monkeypatch):
+    url = "https://research.example/results"
+    path = "web/results.html"
+    job = uuid4().hex
+    archive = io.BytesIO()
+    with ZipFile(archive, "w") as result:
+        result.writestr(
+            "wiki-index.md",
+            "# 资料索引\n\n已完成 1 个文件 · 处理失败 0 个文件 · 未能接收 0 个来源\n\n"
+            f"- {path} — Public results. · [摘要]({path}.brief.md) · [正文]({path}.export.md)\n",
+        )
+        result.writestr(f"{path}.brief.md", "Public research summary.")
+        result.writestr(
+            f"{path}.export.md",
+            f"来源：<{url}>\n\n# Public results\n\nThe study measured 42 units in its first quarter.",
+        )
+
+    calls = []
+
+    def host(request):
+        calls.append((request.method, request.url.path))
+        if request.url.host == "api.deepseek.com":
+            assert request.headers["Authorization"] == "Bearer test-deepseek"
+            assert json.loads(request.content) == {
+                "query": "public quarterly research",
+                "count": 8,
+                "need_content": False,
+            }
+            return httpx.Response(
+                200,
+                json={
+                    "results": [
+                        {"url": url, "title": "Public results", "summary": "First quarter study"},
+                        {"url": "javascript:invalid", "title": "Invalid URL"},
+                    ]
+                },
+            )
+        assert request.url.host == "preprocessor.example"
+        assert request.headers["Authorization"] == "Bearer test-preprocessor"
+        endpoint = request.url.path.rsplit("/", 1)[-1]
+        if endpoint == "urls":
+            assert json.loads(request.content) == {"urls": [{"url": url}]}
+            return httpx.Response(201)
+        if endpoint == "jobs":
+            return httpx.Response(201, json={"id": job})
+        if endpoint == "commit":
+            return httpx.Response(200)
+        if endpoint == "download":
+            return httpx.Response(200, content=archive.getvalue())
+        assert endpoint == job
+        return httpx.Response(200, json={"state": "succeeded", "download_ready": True})
+
+    client = httpx.AsyncClient
+    monkeypatch.setattr(
+        httpx, "AsyncClient", lambda **kwargs: client(**kwargs, transport=httpx.MockTransport(host))
+    )
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "test-deepseek")
+
+    def choose(messages):
+        results = tool_data(messages, "search_web")
+        assert [item["url"] for item in results] == [url]
+        assert results[0]["summary"] == "First quarter study"
+        return tool_call("add_source_urls", {"urls": [url]})
+
+    def refresh(messages):
+        imported = tool_data(messages, "add_source_urls")
+        assert imported["preprocessing_state"] == "succeeded"
+        return tool_call("synthesize_source_overview", {})
+
+    def list_pages(messages):
+        assert tool_data(messages, "synthesize_source_overview")["reviewed"] == 1
+        return tool_call("list_sources", {})
+
+    def read_evidence(messages):
+        (page,) = tool_data(messages, "list_sources")["sources"]
+        assert page["url"] == url
+        return tool_call("read_source_evidence", {"file_path": page["id"]})
+
+    def draft(messages):
+        evidence = tool_data(messages, "read_source_evidence")
+        block = next(block for block in evidence["blocks"] if "42 units" in block["text"])
+        cite = f"[[{evidence['source_id']}#{block['id']}]]"
+        return tool_call(
+            "write_file",
+            {
+                "file_path": "/workspace/projects/research.md",
+                "content": "# Public results\n\nThe study measured 42 units in its first quarter. "
+                f"This provides a baseline for later studies of the same scope {cite}.",
+            },
+        )
+
+    lead = ScriptedChatModel(
+        steps=[
+            lambda _: tool_call("search_web", {"query": "public quarterly research"}),
+            choose,
+            refresh,
+            list_pages,
+            read_evidence,
+            draft,
+            lambda _: tool_call(
+                "publish_report", {"draft_path": "/workspace/projects/research.md"}
+            ),
+            lambda messages: reply(tool_data(messages, "publish_report")["delivered"]),
+        ]
+    )
+    settings = Settings(
+        _env_file=None,
+        workspace_root=tmp_path,
+        preprocessor_api_url="https://preprocessor.example",
+        preprocessor_api_key="test-preprocessor",
+    )
+    runtime = build_local_runtime(settings, ROOT, model=lead)
+    thread = "cli-research-" + uuid4().hex[:8]
+    try:
+        messages = await runtime.ask(
+            "Research public quarterly results and write a report.", thread_id=thread
+        )
+        html = (runtime.out_dir / thread / final_text(messages)).read_text()
+        assert f'href="{url}"' in html
+        assert "1/1 reviewed" in html
+        assert calls == [
+            ("POST", "/v1/tools/search"),
+            ("POST", "/api/v1/jobs"),
+            ("POST", f"/api/v1/jobs/{job}/urls"),
+            ("POST", f"/api/v1/jobs/{job}/commit"),
+            ("GET", f"/api/v1/jobs/{job}"),
+            ("GET", f"/api/v1/jobs/{job}/download"),
+        ]
     finally:
         await runtime.aclose()
         runtime.binding.runner.stop_all()

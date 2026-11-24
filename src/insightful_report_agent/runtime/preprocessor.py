@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Sequence
+from contextlib import nullcontext
 from io import BytesIO
 from typing import Literal
 from uuid import UUID
@@ -32,7 +34,11 @@ def is_prepared(name: str, content: bytes) -> bool:
 
 
 async def preprocess(
-    settings: Settings, trace: Observability, files: dict[str, bytes]
+    settings: Settings,
+    trace: Observability | None,
+    files: dict[str, bytes],
+    *,
+    urls: Sequence[str] = (),
 ) -> tuple[str, bytes, Literal["succeeded", "partial"]]:
     transport = httpx.AsyncClient(
         base_url=settings.preprocessor_api_url,
@@ -40,7 +46,11 @@ async def preprocess(
         timeout=90,
         trust_env=False,
     )
-    with trace.span("preprocessor.job", files=len(files)) as span:
+
+    def span_for(name: str, **metadata: int):
+        return trace.span(name, **metadata) if trace is not None else nullcontext()
+
+    with span_for("preprocessor.job", files=len(files), urls=len(urls)) as span:
         try:
             async with transport, asyncio.timeout(settings.preprocessor_timeout_seconds):
                 job_id = (await transport.post("/api/v1/jobs")).raise_for_status().json()["id"]
@@ -49,7 +59,12 @@ async def preprocess(
                 if span:
                     span.update(metadata={"job_id": str(job_id), "files": len(files)})
                 path = f"/api/v1/jobs/{job_id}"
-                with trace.span("preprocessor.upload", files=len(files)):
+                with span_for("preprocessor.upload", files=len(files), urls=len(urls)):
+                    if urls:
+                        response = await transport.post(
+                            f"{path}/urls", json={"urls": [{"url": url} for url in urls]}
+                        )
+                        response.raise_for_status()
                     for name, data in files.items():
                         response = await transport.put(
                             f"{path}/files",
@@ -59,7 +74,7 @@ async def preprocess(
                         )
                         response.raise_for_status()
                     (await transport.post(f"{path}/commit")).raise_for_status()
-                with trace.span("preprocessor.wait") as wait:
+                with span_for("preprocessor.wait") as wait:
                     while True:
                         job = (await transport.get(path)).raise_for_status().json()
                         if job["state"] in {"succeeded", "partial", "failed"}:
@@ -70,7 +85,7 @@ async def preprocess(
                     state = job["state"]
                     if not job["download_ready"] or state == "failed":
                         raise PreprocessorError("Preprocessing failed; no usable ZIP was returned")
-                with trace.span("preprocessor.download") as download:
+                with span_for("preprocessor.download") as download:
                     result = bytearray()
                     async with transport.stream("GET", f"{path}/download") as response:
                         response.raise_for_status()

@@ -97,14 +97,34 @@ def build_agent_components(
     prompt = (root / "instructions.md").read_text(encoding="utf-8")
     if settings.preprocessor_docs_url:
         prompt += f"\nConfigured preprocessor documentation: {settings.preprocessor_docs_url}\n"
-    if not library.legacy and settings.preprocessor_api_url and settings.preprocessor_api_key:
+    if library.preprocess_urls:
         prompt += (
             "\nThe host submits uploaded raw files to the external preprocessor automatically. "
-            "Users may upload raw files or a prepared result ZIP. For URL or WebDAV references, "
-            "explain the external preprocessing handoff when the converted sources are missing.\n"
+            "Users may upload raw files or a prepared result ZIP. Import public webpages with "
+            "add_source_urls. For WebDAV references, explain the external preprocessing handoff "
+            "when the converted sources are missing.\n"
         )
     if library.legacy:
         prompt += "\nThis thread uses legacy raw source intake. Follow the legacy tool descriptions.\n"
+    if library.exa_search or library.search_key:
+        prompt += (
+            "\nWhen planning the report, identify claims that need up-to-date information, "
+            "independent corroboration or evidence missing from the supplied materials. "
+            "Call search_web before drafting those claims when public research is in scope. "
+            "Also call it when the user explicitly asks to search, browse or verify online. "
+            "Respect source-only requests. Use public keywords and omit private names, "
+            "identifiers, source text and private URLs. Treat search summaries as leads.\n"
+        )
+        if library.legacy or library.preprocess_urls:
+            prompt += (
+                "Import selected public URLs with add_source_urls, refresh the source overview, "
+                "and verify the imported evidence blocks before citing them.\n"
+            )
+        else:
+            prompt += (
+                "To cite a discovered page, ask for its preprocessed export if it is not "
+                "already in the source inventory.\n"
+            )
     return AgentComponents(
         model=lead,
         tools=tuple([*library.tools(), *mcp_tools]),

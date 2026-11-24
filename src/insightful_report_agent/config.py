@@ -73,6 +73,7 @@ class Settings(BaseSettings):
     model_effort: str | None = None
     """Lead effort; unset uses the registry default for the model (`high` for Claude 5)."""
     source_input_mode: Literal["preprocessed", "legacy"] = "preprocessed"
+    enable_web_search: bool = True
     preprocessor_docs_url: str | None = None
     preprocessor_api_url: str | None = None
     preprocessor_api_key: SecretStr | None = Field(default=None, validation_alias="BRFP_API_KEY")
